@@ -12,11 +12,13 @@ import pytest
 has_httpx2 = find_spec("httpx2") is not None
 has_requests = find_spec("requests") is not None
 has_aiohttp = find_spec("aiohttp") is not None
+has_aiobotocore = find_spec("aiobotocore") is not None
 has_zstd = find_spec("compression") is not None and find_spec("compression.zstd") is not None
 
 needs_httpx2 = pytest.mark.skipif(not has_httpx2, reason="httpx2 not installed")
 needs_requests = pytest.mark.skipif(not has_requests, reason="requests not installed")
 needs_aiohttp = pytest.mark.skipif(not has_aiohttp, reason="aiohttp not installed")
+needs_aiobotocore = pytest.mark.skipif(not has_aiobotocore, reason="aiobotocore not installed")
 needs_zstd = pytest.mark.skipif(not has_zstd, reason="compression.zstd not available")
 
 
@@ -25,7 +27,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--all-backends",
         action="store_true",
         default=False,
-        help="Assert that all optional backends (httpx2, requests, aiohttp) are installed.",
+        help="Assert that all optional backends are installed.",
     )
 
 
@@ -38,6 +40,8 @@ def pytest_configure(config: pytest.Config) -> None:
             missing.append("requests")
         if not has_aiohttp:
             missing.append("aiohttp")
+        if not has_aiobotocore:
+            missing.append("aiobotocore")
         if missing:
             raise pytest.UsageError(
                 f"--all-backends: missing optional backends: {', '.join(missing)}"

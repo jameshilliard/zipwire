@@ -1,8 +1,8 @@
 Backends
 ========
 
-zipwire uses pluggable HTTP backends to fetch byte ranges from remote
-servers.  Each backend is a thin wrapper around a popular HTTP library that
+zipwire uses pluggable backends to fetch byte ranges from HTTP servers,
+S3 objects, and local files. Each backend is a thin wrapper that
 implements the :class:`~zipwire.SyncReader` or :class:`~zipwire.AsyncReader`
 protocol.
 
@@ -43,6 +43,11 @@ Available backends
      - async
      - 1.1
      - ``aiohttp``
+   * - aiobotocore
+     - :class:`~zipwire.backends.AiobotocoreReader`
+     - async
+     - S3 API
+     - ``aiobotocore``
    * - local files
      - :class:`~zipwire.backends.FileReader`
      - sync
@@ -73,6 +78,55 @@ Choosing a backend
 - **Local archives** - use :class:`~zipwire.backends.FileReader` or
   :class:`~zipwire.backends.AsyncFileReader` to read a ZIP or wheel that
   already lives on the local filesystem.  No extra dependency is required.
+- **S3 archives** - use :class:`~zipwire.backends.AiobotocoreReader` with an
+  existing async S3 client to read private buckets or S3-compatible services.
+
+Reading S3 objects
+------------------
+
+Install ``zipwire[aiobotocore]`` and pass an open aiobotocore S3 client to
+:class:`~zipwire.backends.AiobotocoreReader`. The bucket and key are passed
+unchanged to the SDK. The client controls authentication, endpoints,
+retries, and the HTTP transport. Zipwire does not create or close the client.
+
+.. code-block:: python
+
+   from aiobotocore.session import get_session
+
+   from zipwire import AsyncRemoteZip
+   from zipwire.backends import AiobotocoreReader
+
+   async with get_session().create_client("s3", region_name="us-east-1") as client:
+       reader = AiobotocoreReader("my-bucket", "archives/data.zip", client=client)
+       async with AsyncRemoteZip(reader) as rz:
+           data = await rz.read("file.txt")
+
+The reader caches ``HeadObject`` metadata and sends ``IfMatch`` with every
+range GET. An overwrite fails with the SDK's precondition error instead of
+combining bytes from different objects. To select a particular version, pass
+``extra_args={"VersionId": "..."}``. Other supported extra arguments are
+``RequestPayer``, ``ExpectedBucketOwner``, ``SSECustomerAlgorithm``,
+``SSECustomerKey``, ``SSECustomerKeyMD5``, and ``ChecksumMode``. They are sent
+to both ``HeadObject`` and ``GetObject``. SDK errors propagate unchanged.
+
+Range responses must have status 206 and matching ``ContentRange`` and
+``ContentLength``. Read-ahead is clamped at the object's end; zero-length
+ranges do not issue a GET. ``stream_range`` reads in bounded chunks, while
+``read_range`` buffers its requested range in memory.
+
+Each response body is managed with an async context manager. Closing the
+reader also closes unfinished responses, leaving the supplied client open.
+Response cleanup finishes before cancellation propagates, including repeated
+asyncio task cancellation and timeouts.
+When using ``stream_range`` directly, wrap it with ``contextlib.aclosing``
+if iteration may stop early. The reader itself supports ``async with`` and
+cannot be reused after closing. Use one reader per archive/task.
+
+To use aiobotocore's HTTPX2 transport, install ``aiobotocore[httpx2]`` and
+pass ``AioConfig(http_session_cls=HttpxSession)`` to ``create_client``;
+import these classes from ``aiobotocore.config`` and
+``aiobotocore.httpxsession`` respectively. The reader works with either
+aiobotocore transport.
 
 Reading local files
 -------------------
@@ -125,9 +179,10 @@ such as ``aiofiles`` use internally, without the extra dependency.
 Passing an existing client
 --------------------------
 
-Every backend constructor accepts an optional pre-configured client or
-session.  When you pass one, zipwire will **not** close it - you remain
-responsible for its lifecycle.
+HTTP backend constructors accept an optional pre-configured client or
+session; :class:`~zipwire.backends.AiobotocoreReader` requires an S3 client.
+When you pass one, zipwire will **not** close it - you remain responsible
+for its lifecycle.
 
 .. code-block:: python
 
@@ -183,6 +238,13 @@ protocol and pass an instance to :class:`~zipwire.SyncRemoteZip` or
 
 See the :class:`~zipwire.SyncReader` and :class:`~zipwire.AsyncReader`
 protocol definitions for the full method signatures.
+
+Async readers can return any asynchronous iterator from ``stream_range``.
+If it provides an async ``aclose()`` method,
+:meth:`~zipwire.AsyncRemoteZip.read_into` awaits it before returning or
+propagating an extraction error. An async generator can release per-stream
+resources in a ``finally`` block. Iterators without ``aclose()`` remain
+supported; the reader remains responsible for any resources they retain.
 
 Why only absolute byte ranges?
 -------------------------------

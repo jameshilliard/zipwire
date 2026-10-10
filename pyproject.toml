@@ -34,7 +34,8 @@ Issues = "https://github.com/tiran/zipwire/issues"
 httpx2 = ["httpx2[http2]>=2"]
 aiohttp = ["aiohttp>=3.9"]
 requests = ["requests>=2.28"]
-all = ["httpx2[http2]>=2", "aiohttp>=3.9", "requests>=2.28"]
+aiobotocore = ["aiobotocore>=3.9.2"]
+all = ["httpx2[http2]>=2", "aiohttp>=3.9", "requests>=2.28", "aiobotocore>=3.9.2"]
 
 [dependency-groups]
 dev = [

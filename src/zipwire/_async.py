@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import typing
+from contextlib import AsyncExitStack
 
 from zipwire._base import RemoteZipBase
 from zipwire._constants import (
@@ -16,6 +17,8 @@ from zipwire._parser import find_eocd, parse_local_file_header
 from zipwire._zipinfo import RemoteZipInfo
 
 if typing.TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from zipwire._types import AsyncReader, Writable
 
 
@@ -181,6 +184,9 @@ class AsyncRemoteZip(RemoteZipBase):
         decompression, aborting if the actual output exceeds the limit
         regardless of what the entry metadata claims.
 
+        If the stream provides ``aclose()``, it is awaited when streaming
+        finishes or fails, so its resources are released promptly.
+
         Args:
             name: Filename string or RemoteZipInfo object.
             dest: A writable file-like object (e.g. ``io.BytesIO``, open file).
@@ -205,6 +211,12 @@ class AsyncRemoteZip(RemoteZipBase):
         if prefetched is not None:
             sd.feed(prefetched)
         else:
-            async for chunk in self._reader.stream_range(data_offset, info.compress_size):
-                sd.feed(chunk)
+            stream = self._reader.stream_range(data_offset, info.compress_size)
+            async with AsyncExitStack() as cleanup:
+                # Custom readers may return resource-free iterators without aclose().
+                aclose: Callable[[], Awaitable[None]] | None = getattr(stream, "aclose", None)
+                if aclose is not None:
+                    cleanup.push_async_callback(aclose)
+                async for chunk in stream:
+                    sd.feed(chunk)
         sd.finish()

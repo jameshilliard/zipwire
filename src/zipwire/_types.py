@@ -100,7 +100,11 @@ class AsyncReader(typing.Protocol):
         ...
 
     def stream_range(self, offset: int, length: int) -> AsyncIterator[bytes]:
-        """Stream *length* bytes starting at *offset* as chunks."""
+        """Stream *length* bytes starting at *offset* as chunks.
+
+        If the iterator provides ``aclose()``, AsyncRemoteZip.read_into()
+        awaits it after streaming, including when extraction fails.
+        """
         ...
 
     async def close(self) -> None:

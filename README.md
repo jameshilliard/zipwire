@@ -32,6 +32,8 @@ CDNs, object stores, and static file servers do.
 - **Pluggable backends** - bring your own HTTP library (see below).
 - **Local files** - `FileReader` / `AsyncFileReader` open an archive on disk
   through the exact same API, no HTTP server required.
+- **S3 objects** - `AiobotocoreReader` reads byte ranges with an existing
+  async S3 client, including private buckets and S3-compatible endpoints.
 
 ## Installation and backends
 
@@ -50,9 +52,29 @@ pip install zipwire[httpx2]
 | httpx2   | `Httpx2AsyncReader`  | async | 1.1, 2  | `httpx2`      |
 | requests | `RequestsReader`     | sync  | 1.1     | `requests`    |
 | aiohttp  | `AiohttpReader`      | async | 1.1     | `aiohttp`     |
+| aiobotocore | `AiobotocoreReader` | async | S3 API | `aiobotocore` |
 
 Every HTTP backend accepts an optional pre-configured client or session so you
 can share connection pools, authentication, and retry configuration.
+
+`AiobotocoreReader` requires a caller-owned aiobotocore S3 client. Configure
+credentials, endpoints, retries, and HTTP transport on that client, then
+pass it with the bucket and key:
+
+```python
+from aiobotocore.session import get_session
+
+from zipwire import AsyncRemoteZip
+from zipwire.backends import AiobotocoreReader
+
+async with get_session().create_client("s3") as client:
+    reader = AiobotocoreReader("my-bucket", "archives/data.zip", client=client)
+    async with AsyncRemoteZip(reader) as rz:
+        data = await rz.read("file.txt")
+```
+
+Range requests use the object's ETag to detect changes during extraction.
+Pass `extra_args={"VersionId": "..."}` to select a specific object version.
 
 For archives that already live on the local filesystem, `FileReader` and
 `AsyncFileReader` (in `zipwire.backends`, no extra dependency) satisfy the same

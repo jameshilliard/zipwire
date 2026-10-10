@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
+import typing
 import zipfile
+import zlib
 
 import pytest
 
@@ -11,6 +14,30 @@ from tests.conftest import MockAsyncReader
 from zipwire import AsyncRemoteZip, EOCDInfo
 from zipwire._errors import FileNotFoundInZip, FileTooLarge, RangeRequestUnsupported
 from zipwire._zipinfo import RemoteZipInfo
+
+if typing.TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, AsyncIterator
+
+
+class FailingWriter:
+    def write(self, data: bytes) -> None:
+        raise OSError("destination write failed")
+
+
+class IteratorWithoutClose:
+    """A resource-free async iterator, allowed by the reader protocol."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data: bytes | None = data
+
+    def __aiter__(self) -> IteratorWithoutClose:
+        return self
+
+    async def __anext__(self) -> bytes:
+        if self.data is None:
+            raise StopAsyncIteration
+        data, self.data = self.data, None
+        return data
 
 
 class TestAsyncRemoteZip:
@@ -258,6 +285,68 @@ class TestAsyncRemoteZip:
             dest = io.BytesIO()
             await rz.read_into("large.bin", dest)
         assert dest.getvalue() == expected
+
+    @pytest.mark.parametrize("failure", ["write", "decompress", "size_limit"])
+    async def test_read_into_failure_closes_stream(
+        self, large_file_zip: bytes, monkeypatch: pytest.MonkeyPatch, failure: str
+    ) -> None:
+        reader = MockAsyncReader(large_file_zip)
+        closed = False
+
+        async def chunks(offset: int, length: int) -> AsyncGenerator[bytes, None]:
+            nonlocal closed
+            try:
+                yield reader.data[offset : offset + length]
+            finally:
+                await asyncio.sleep(0)
+                closed = True
+
+        async with AsyncRemoteZip(reader) as rz:
+            info = rz.getinfo("large.bin")
+            offset = info.header_offset + len(info.FileHeader())
+            # Retain the generator so collection cannot hide missing cleanup.
+            stream = chunks(offset, info.compress_size)
+            monkeypatch.setattr(reader, "stream_range", lambda offset, length: stream)
+            error: type[Exception]
+            if failure == "decompress":
+                info.compress_type = zipfile.ZIP_DEFLATED
+                error = zlib.error
+            elif failure == "size_limit":
+                info.file_size = 0  # Force the limit to be checked during streaming.
+                error = FileTooLarge
+            else:
+                error = OSError
+            try:
+                with pytest.raises(error):
+                    await rz.read_into(
+                        info,
+                        FailingWriter() if failure == "write" else io.BytesIO(),
+                        max_file_size=1 if failure == "size_limit" else None,
+                    )
+                assert closed
+                assert not reader.closed
+            finally:
+                await stream.aclose()
+
+    @pytest.mark.parametrize("fail_write", [False, True])
+    async def test_read_into_iterator_without_close(
+        self, large_file_zip: bytes, monkeypatch: pytest.MonkeyPatch, fail_write: bool
+    ) -> None:
+        reader = MockAsyncReader(large_file_zip)
+
+        def stream_range(offset: int, length: int) -> AsyncIterator[bytes]:
+            return IteratorWithoutClose(reader.data[offset : offset + length])
+
+        monkeypatch.setattr(reader, "stream_range", stream_range)
+        async with AsyncRemoteZip(reader) as rz:
+            if fail_write:
+                with pytest.raises(OSError, match="destination write failed"):
+                    await rz.read_into("large.bin", FailingWriter())
+            else:
+                dest = io.BytesIO()
+                await rz.read_into("large.bin", dest)
+                assert dest.getvalue() == bytes(range(256)) * 208
+            assert not reader.closed
 
     async def test_read_zstandard(self, zstandard_zip: bytes) -> None:
         reader = MockAsyncReader(zstandard_zip)

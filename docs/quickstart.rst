@@ -108,6 +108,38 @@ Async with httpx2
 
    asyncio.run(main())
 
+Async S3 archive
+^^^^^^^^^^^^^^^^
+
+Install ``zipwire[aiobotocore]``. Supply an open S3 client so the application
+controls its credentials, endpoint, retries, and HTTP transport:
+
+.. code-block:: python
+
+   import asyncio
+
+   from aiobotocore.session import get_session
+
+   from zipwire import AsyncRemoteZip
+   from zipwire.backends import AiobotocoreReader
+
+
+   async def main():
+       async with get_session().create_client("s3") as client:
+           reader = AiobotocoreReader("my-bucket", "archives/data.zip", client=client)
+           async with AsyncRemoteZip(reader) as rz:
+               print(rz.namelist())
+               data = await rz.read("file.txt")
+               print(data.decode())
+
+
+   asyncio.run(main())
+
+The reader closes response bodies but leaves the client open. Its range
+requests check the object's ETag so an overwrite during extraction raises
+an error. Pass ``extra_args={"VersionId": "..."}`` to select a version;
+see :doc:`backends` for requester-pays and encryption options.
+
 Async local archive
 ^^^^^^^^^^^^^^^^^^^
 
@@ -193,7 +225,8 @@ Async variant:
 Passing a pre-configured client
 --------------------------------
 
-All backends accept an optional pre-configured client or session:
+HTTP backends accept an optional pre-configured client or session. The S3
+backend requires an existing client, as shown above:
 
 .. code-block:: python
 

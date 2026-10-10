@@ -58,6 +58,19 @@ Asynchronous:
   - ``AiohttpReader`` -- uses *aiohttp* (``pip install zipwire[aiohttp]``)
   - ``Httpx2AsyncReader`` -- uses *httpx2*, supports HTTP/2
     (``pip install zipwire[httpx2]``)
+  - ``AiobotocoreReader`` -- reads S3 objects with a caller-owned async S3
+    client (``pip install zipwire[aiobotocore]``)
+
+::
+
+    from aiobotocore.session import get_session
+    from zipwire import AsyncRemoteZip
+    from zipwire.backends import AiobotocoreReader
+
+    async with get_session().create_client("s3") as client:
+        reader = AiobotocoreReader("my-bucket", "archive.zip", client=client)
+        async with AsyncRemoteZip(reader) as rz:
+            data = await rz.read("file.txt")
 
 Local files:
   - ``FileReader`` / ``AsyncFileReader`` -- read an archive from the local

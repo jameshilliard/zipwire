@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import typing
+from contextlib import AsyncExitStack
+from inspect import isawaitable
 
 from zipwire._base import RemoteZipBase
 from zipwire._constants import (
@@ -16,7 +18,7 @@ from zipwire._parser import find_eocd, parse_local_file_header
 from zipwire._zipinfo import RemoteZipInfo
 
 if typing.TYPE_CHECKING:
-    from zipwire._types import AsyncReader, Writable
+    from zipwire._types import AsyncReader, AsyncWritable, Writable
 
 
 class AsyncRemoteZip(RemoteZipBase):
@@ -167,7 +169,7 @@ class AsyncRemoteZip(RemoteZipBase):
     async def read_into(
         self,
         name: str | RemoteZipInfo,
-        dest: Writable,
+        dest: Writable | AsyncWritable,
         *,
         max_file_size: int | None = None,
     ) -> None:
@@ -181,9 +183,19 @@ class AsyncRemoteZip(RemoteZipBase):
         decompression, aborting if the actual output exceeds the limit
         regardless of what the entry metadata claims.
 
+        If ``dest.write()`` returns an awaitable, it is awaited before
+        further input is read or decompressed. Synchronous destinations
+        are supported too; their writes run on the event-loop thread.
+        Each write must accept the entire chunk or raise an exception.
+
+        The caller owns *dest*: this method does not flush, close, or
+        commit it. Errors and cancellation may leave partial output;
+        only a successful return indicates that CRC verification passed.
+
         Args:
             name: Filename string or RemoteZipInfo object.
-            dest: A writable file-like object (e.g. ``io.BytesIO``, open file).
+            dest: A synchronous or asynchronous writable object, such as
+                ``io.BytesIO`` or ``anyio.AsyncFile``.
             max_file_size: Optional limit on uncompressed size in bytes.
                 Raises :exc:`~zipwire.FileTooLarge` if the entry's
                 ``file_size`` exceeds this limit, or if the actual
@@ -198,13 +210,26 @@ class AsyncRemoteZip(RemoteZipBase):
         sd = StreamingDecompressor(
             info.compress_type,
             info.CRC,
-            dest,
             filename=info.filename,
             max_output_size=max_file_size,
         )
         if prefetched is not None:
-            sd.feed(prefetched)
+            await _write_output(dest, sd.feed(prefetched))
         else:
-            async for chunk in self._reader.stream_range(data_offset, info.compress_size):
-                sd.feed(chunk)
-        sd.finish()
+            async with AsyncExitStack() as stack:
+                stream = self._reader.stream_range(data_offset, info.compress_size)
+                # AsyncReader permits any async iterator. Register cleanup
+                # when it supports aclose(), as all built-in backends do.
+                if close := getattr(stream, "aclose", None):
+                    stack.push_async_callback(close)
+                async for chunk in stream:
+                    await _write_output(dest, sd.feed(chunk))
+        await _write_output(dest, sd.finish())
+
+
+async def _write_output(dest: Writable | AsyncWritable, data: bytes) -> None:
+    """Finish one nonempty write before the caller produces more output."""
+    if data:
+        result = dest.write(data)
+        if isawaitable(result):
+            await result

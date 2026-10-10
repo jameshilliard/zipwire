@@ -132,22 +132,37 @@ blocking file IO to a worker thread so it never stalls the event loop:
 Async streaming to disk
 ^^^^^^^^^^^^^^^^^^^^^^^^
 
+:meth:`~zipwire.AsyncRemoteZip.read_into` accepts async destinations such as
+``anyio.AsyncFile``. Install AnyIO separately for this example. Each write is
+awaited before extraction continues:
+
 .. code-block:: python
 
    import asyncio
 
+   import anyio
+
    from zipwire import AsyncRemoteZip
-   from zipwire.backends import AiohttpReader
+   from zipwire.backends import Httpx2AsyncReader
 
 
    async def main():
-       reader = AiohttpReader("https://archive.example/large.zip")
+       reader = Httpx2AsyncReader("https://archive.example/large.zip")
        async with AsyncRemoteZip(reader) as rz:
-           with open("output.bin", "wb") as f:
+           async with await anyio.open_file("output.bin", "wb") as f:
                await rz.read_into("big-file.bin", f)
 
 
    asyncio.run(main())
+
+Synchronous destinations such as ``io.BytesIO`` remain supported. Their
+``write()`` calls run on the event-loop thread, so use an async destination
+for blocking disk or network writes.
+
+The destination remains open after ``read_into`` returns. The caller must
+flush, close, or commit it as appropriate. Treat partial output as invalid
+if extraction raises or is cancelled: CRC verification is complete only
+when ``read_into`` returns successfully.
 
 Wheel dist-info metadata
 ------------------------

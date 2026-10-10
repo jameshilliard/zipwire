@@ -60,6 +60,9 @@ Protocols and Types
 .. autoclass:: zipwire.Writable
    :members:
 
+.. autoclass:: zipwire.AsyncWritable
+   :members:
+
 Backends
 --------
 

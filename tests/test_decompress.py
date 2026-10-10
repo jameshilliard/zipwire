@@ -72,9 +72,9 @@ def test_streaming_stored_simple() -> None:
     data = b"Hello, World!"
     crc = zlib.crc32(data) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=0, expected_crc=crc, dest=dest)
-    sd.feed(data)
-    sd.finish()
+    sd = StreamingDecompressor(method=0, expected_crc=crc)
+    dest.write(sd.feed(data))
+    dest.write(sd.finish())
     assert dest.getvalue() == data
 
 
@@ -82,8 +82,8 @@ def test_streaming_stored_empty() -> None:
     data = b""
     crc = zlib.crc32(data) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=0, expected_crc=crc, dest=dest)
-    sd.finish()
+    sd = StreamingDecompressor(method=0, expected_crc=crc)
+    dest.write(sd.finish())
     assert dest.getvalue() == b""
 
 
@@ -91,9 +91,9 @@ def test_streaming_stored_binary() -> None:
     data = bytes(range(256))
     crc = zlib.crc32(data) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=0, expected_crc=crc, dest=dest)
-    sd.feed(data)
-    sd.finish()
+    sd = StreamingDecompressor(method=0, expected_crc=crc)
+    dest.write(sd.feed(data))
+    dest.write(sd.finish())
     assert dest.getvalue() == data
 
 
@@ -101,10 +101,10 @@ def test_streaming_stored_chunked() -> None:
     data = b"A" * 1000
     crc = zlib.crc32(data) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=0, expected_crc=crc, dest=dest)
+    sd = StreamingDecompressor(method=0, expected_crc=crc)
     for pos in range(0, len(data), 100):
-        sd.feed(data[pos : pos + 100])
-    sd.finish()
+        dest.write(sd.feed(data[pos : pos + 100]))
+    dest.write(sd.finish())
     assert dest.getvalue() == data
 
 
@@ -113,9 +113,9 @@ def test_streaming_deflated_simple() -> None:
     compressed = zlib.compress(original, level=6)[2:-4]
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=8, expected_crc=crc, dest=dest)
-    sd.feed(compressed)
-    sd.finish()
+    sd = StreamingDecompressor(method=8, expected_crc=crc)
+    dest.write(sd.feed(compressed))
+    dest.write(sd.finish())
     assert dest.getvalue() == original
 
 
@@ -124,9 +124,9 @@ def test_streaming_deflated_repeated() -> None:
     compressed = zlib.compress(original, level=6)[2:-4]
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=8, expected_crc=crc, dest=dest)
-    sd.feed(compressed)
-    sd.finish()
+    sd = StreamingDecompressor(method=8, expected_crc=crc)
+    dest.write(sd.feed(compressed))
+    dest.write(sd.finish())
     assert dest.getvalue() == original
 
 
@@ -135,26 +135,25 @@ def test_streaming_deflated_chunked() -> None:
     compressed = zlib.compress(original, level=6)[2:-4]
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=8, expected_crc=crc, dest=dest)
+    sd = StreamingDecompressor(method=8, expected_crc=crc)
     for pos in range(0, len(compressed), 100):
-        sd.feed(compressed[pos : pos + 100])
-    sd.finish()
+        dest.write(sd.feed(compressed[pos : pos + 100]))
+    dest.write(sd.finish())
     assert dest.getvalue() == original
 
 
 def test_streaming_crc_mismatch() -> None:
     data = b"Hello, World!"
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=0, expected_crc=0xDEADBEEF, dest=dest)
-    sd.feed(data)
+    sd = StreamingDecompressor(method=0, expected_crc=0xDEADBEEF)
+    dest.write(sd.feed(data))
     with pytest.raises(CRCMismatch):
-        sd.finish()
+        dest.write(sd.finish())
 
 
 def test_streaming_unsupported_method() -> None:
-    dest = io.BytesIO()
     with pytest.raises(UnsupportedCompression, match="99"):
-        StreamingDecompressor(method=99, expected_crc=0, dest=dest)
+        StreamingDecompressor(method=99, expected_crc=0)
 
 
 # --- bzip2 ---
@@ -177,9 +176,9 @@ def test_streaming_bzip2() -> None:
     compressed = bz2.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=12, expected_crc=crc, dest=dest)
-    sd.feed(compressed)
-    sd.finish()
+    sd = StreamingDecompressor(method=12, expected_crc=crc)
+    dest.write(sd.feed(compressed))
+    dest.write(sd.finish())
     assert dest.getvalue() == original
 
 
@@ -190,10 +189,10 @@ def test_streaming_bzip2_chunked() -> None:
     compressed = bz2.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=12, expected_crc=crc, dest=dest)
+    sd = StreamingDecompressor(method=12, expected_crc=crc)
     for pos in range(0, len(compressed), 100):
-        sd.feed(compressed[pos : pos + 100])
-    sd.finish()
+        dest.write(sd.feed(compressed[pos : pos + 100]))
+    dest.write(sd.finish())
     assert dest.getvalue() == original
 
 
@@ -217,9 +216,9 @@ def test_streaming_lzma() -> None:
     compressed = lzma.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=14, expected_crc=crc, dest=dest)
-    sd.feed(compressed)
-    sd.finish()
+    sd = StreamingDecompressor(method=14, expected_crc=crc)
+    dest.write(sd.feed(compressed))
+    dest.write(sd.finish())
     assert dest.getvalue() == original
 
 
@@ -230,10 +229,10 @@ def test_streaming_lzma_chunked() -> None:
     compressed = lzma.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=14, expected_crc=crc, dest=dest)
+    sd = StreamingDecompressor(method=14, expected_crc=crc)
     for pos in range(0, len(compressed), 100):
-        sd.feed(compressed[pos : pos + 100])
-    sd.finish()
+        dest.write(sd.feed(compressed[pos : pos + 100]))
+    dest.write(sd.finish())
     assert dest.getvalue() == original
 
 
@@ -255,9 +254,9 @@ def test_streaming_zstandard() -> None:
     compressed = zstd.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=93, expected_crc=crc, dest=dest)
-    sd.feed(compressed)
-    sd.finish()
+    sd = StreamingDecompressor(method=93, expected_crc=crc)
+    dest.write(sd.feed(compressed))
+    dest.write(sd.finish())
     assert dest.getvalue() == original
 
 
@@ -267,10 +266,10 @@ def test_streaming_zstandard_chunked() -> None:
     compressed = zstd.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=93, expected_crc=crc, dest=dest)
+    sd = StreamingDecompressor(method=93, expected_crc=crc)
     for pos in range(0, len(compressed), 100):
-        sd.feed(compressed[pos : pos + 100])
-    sd.finish()
+        dest.write(sd.feed(compressed[pos : pos + 100]))
+    dest.write(sd.finish())
     assert dest.getvalue() == original
 
 
@@ -296,10 +295,10 @@ def test_streaming_zstandard_crc_mismatch() -> None:
     original = b"Hello, Zstandard World!"
     compressed = zstd.compress(original)
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=93, expected_crc=0xDEADBEEF, dest=dest)
-    sd.feed(compressed)
+    sd = StreamingDecompressor(method=93, expected_crc=0xDEADBEEF)
+    dest.write(sd.feed(compressed))
     with pytest.raises(CRCMismatch):
-        sd.finish()
+        dest.write(sd.finish())
 
 
 # --- FileTooLarge ---
@@ -309,6 +308,6 @@ def test_streaming_file_too_large() -> None:
     data = b"A" * 100
     crc = zlib.crc32(data) & 0xFFFFFFFF
     dest = io.BytesIO()
-    sd = StreamingDecompressor(method=0, expected_crc=crc, dest=dest, max_output_size=10)
+    sd = StreamingDecompressor(method=0, expected_crc=crc, max_output_size=10)
     with pytest.raises(FileTooLarge):
-        sd.feed(data)
+        dest.write(sd.feed(data))

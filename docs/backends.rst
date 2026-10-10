@@ -184,6 +184,22 @@ protocol and pass an instance to :class:`~zipwire.SyncRemoteZip` or
 See the :class:`~zipwire.SyncReader` and :class:`~zipwire.AsyncReader`
 protocol definitions for the full method signatures.
 
+Output destinations
+-------------------
+
+Input backends are independent of output destinations.
+:meth:`~zipwire.AsyncRemoteZip.read_into` accepts both :class:`~zipwire.Writable`
+and :class:`~zipwire.AsyncWritable`. An async writer's ``write(data)`` returns
+an awaitable which must finish writing the entire chunk or raise. Zipwire
+awaits each write before reading or decompressing more input, so the
+destination controls the pace of extraction. Write return values are ignored.
+
+The caller owns the destination. Zipwire does not flush, close, or commit it,
+and an error or cancellation may leave partial output. Commit an upload only
+after ``read_into`` returns successfully, including its CRC check. Async
+output support requires no additional zipwire dependency; applications choose
+their own file or upload implementation.
+
 Why only absolute byte ranges?
 -------------------------------
 

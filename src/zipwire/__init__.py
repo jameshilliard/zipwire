@@ -28,20 +28,25 @@ Asynchronous example
 ::
 
     import asyncio
+    import anyio
     from zipwire import AsyncRemoteZip
-    from zipwire.backends import AiohttpReader
+    from zipwire.backends import Httpx2AsyncReader
 
     async def main():
-        reader = AiohttpReader("https://example.com/archive.zip")
+        reader = Httpx2AsyncReader("https://example.com/archive.zip")
         async with AsyncRemoteZip(reader) as rz:
             print(rz.namelist())
             data = await rz.read("path/inside/archive.txt")
 
-            # Stream a large entry directly to disk
-            with open("local.bin", "wb") as fh:
+            # Await writes to an async destination (AnyIO installed separately)
+            async with await anyio.open_file("local.bin", "wb") as fh:
                 await rz.read_into("large-file.bin", fh)
 
     asyncio.run(main())
+
+``AsyncRemoteZip.read_into`` accepts both ``Writable`` and ``AsyncWritable``
+destinations. Async writes are awaited before extraction continues. The
+caller owns the destination and handles flushing, closing, or committing it.
 
 Backends
 --------
@@ -113,7 +118,7 @@ from zipwire._errors import (
 )
 from zipwire._parser import EOCDInfo
 from zipwire._sync import SyncRemoteZip
-from zipwire._types import AsyncReader, Headers, SyncReader, Writable
+from zipwire._types import AsyncReader, AsyncWritable, Headers, SyncReader, Writable
 from zipwire._wheel import AsyncRemoteWheel, SyncRemoteWheel
 from zipwire._zipinfo import RemoteZipInfo
 
@@ -121,6 +126,7 @@ __all__ = [
     "AsyncReader",
     "AsyncRemoteWheel",
     "AsyncRemoteZip",
+    "AsyncWritable",
     "BadZipFile",
     "CRCMismatch",
     "CompressionMethod",

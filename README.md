@@ -24,7 +24,8 @@ CDNs, object stores, and static file servers do.
 - **Streaming decompression** - `read_into` decompresses in chunks, keeping
   memory usage low even for large entries.
 - **Sync and async** - `SyncRemoteZip` for synchronous code,
-  `AsyncRemoteZip` with `await`/`async with` for asyncio.
+  `AsyncRemoteZip` with `await`/`async with` for asyncio. Async extraction
+  supports destinations with awaitable `write()` methods.
 - **Wheel metadata** - `SyncRemoteWheel` / `AsyncRemoteWheel` read a Python
   wheel's `.dist-info` (METADATA, WHEEL, RECORD) straight from PyPI in a single
   adaptive tail request, without downloading the wheel.

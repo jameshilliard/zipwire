@@ -5,7 +5,7 @@ from __future__ import annotations
 import typing
 
 if typing.TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Iterator
 
 
 @typing.runtime_checkable
@@ -110,6 +110,22 @@ class AsyncReader(typing.Protocol):
 
 @typing.runtime_checkable
 class Writable(typing.Protocol):
-    """Protocol for writable file-like objects (io.BytesIO, io.BufferedWriter, etc.)."""
+    """Synchronous destination that writes each entire chunk or raises.
+
+    The caller owns the destination and is responsible for flushing and
+    closing it. The return value of :meth:`write` is ignored.
+    """
 
     def write(self, data: bytes, /) -> object: ...
+
+
+@typing.runtime_checkable
+class AsyncWritable(typing.Protocol):
+    """Asynchronous destination that writes each entire chunk or raises.
+
+    Each write is awaited before extraction continues. The caller owns the
+    destination and is responsible for flushing, closing, or committing it.
+    The awaited return value is ignored.
+    """
+
+    def write(self, data: bytes, /) -> Awaitable[object]: ...

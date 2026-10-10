@@ -10,6 +10,8 @@ releases; they are marked **BREAKING**.
 
 ### Added
 
+- `AiobotocoreReader` reads S3 archives using a caller-owned aiobotocore
+  client, available through the `aiobotocore` extra (#50).
 - `SyncRemoteZip` and `AsyncRemoteZip` accept a `metadata_encoding`
   argument that overrides CP437 for entry names without the UTF-8
   flag, as in stdlib `zipfile`.

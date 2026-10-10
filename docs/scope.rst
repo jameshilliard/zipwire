@@ -41,6 +41,10 @@ Local archives are supported through
 :class:`~zipwire.backends.FileReader` and
 :class:`~zipwire.backends.AsyncFileReader`.
 
+S3 objects are supported through :class:`~zipwire.backends.AiobotocoreReader`
+using a caller-owned aiobotocore client. Credentials, endpoints, retries,
+and HTTP transport are configured on that client. See :doc:`backends`.
+
 Out of scope
 ------------
 
@@ -53,10 +57,10 @@ Full ``zipfile`` compatibility
    quirks are out of scope.  Code that needs a general-purpose reader for
    arbitrary local archives should use :mod:`zipfile`.
 
-Other transports (S3, FTP, ...)
-   zipwire reads over HTTP(S) range requests and plain file IO.  Other
-   transports -- for example S3 through aiobotocore or botocore -- are out of
-   scope.  The reader layer is pluggable, though: a third-party package can
+Other transports (FTP, ...)
+   zipwire reads over HTTP(S) range requests, S3 object APIs, and plain file
+   IO. Other transports are out of scope. The reader layer is pluggable,
+   though: a third-party package can
    provide its own transport by implementing the :class:`~zipwire.SyncReader`
    or :class:`~zipwire.AsyncReader` protocol and passing the reader to
    :class:`~zipwire.SyncRemoteZip` or :class:`~zipwire.AsyncRemoteZip`.

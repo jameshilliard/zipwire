@@ -35,7 +35,8 @@ Changelog = "https://github.com/tiran/zipwire/blob/main/CHANGELOG.md"
 httpx2 = ["httpx2[http2]>=2"]
 aiohttp = ["aiohttp>=3.9"]
 requests = ["requests>=2.28"]
-all = ["httpx2[http2]>=2", "aiohttp>=3.9", "requests>=2.28"]
+aiobotocore = ["aiobotocore>=3.9.2"]
+all = ["httpx2[http2]>=2", "aiohttp>=3.9", "requests>=2.28", "aiobotocore>=3.9.2"]
 
 [dependency-groups]
 dev = [
@@ -95,6 +96,11 @@ files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
 module = ["compression", "compression.zstd"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# The SDK packages do not ship type stubs or a py.typed marker.
+module = ["aiobotocore.*", "botocore.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]

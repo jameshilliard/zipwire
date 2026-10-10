@@ -13,6 +13,7 @@ import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from zipwire.backends._aiobotocore import AiobotocoreReader as AiobotocoreReader
     from zipwire.backends._aiohttp import AiohttpReader as AiohttpReader
     from zipwire.backends._file import AsyncFileReader as AsyncFileReader
     from zipwire.backends._file import FileReader as FileReader
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     from zipwire.backends._urllib3 import Urllib3Reader as Urllib3Reader
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
+    "AiobotocoreReader": ("zipwire.backends._aiobotocore", "AiobotocoreReader"),
     "Httpx2SyncReader": ("zipwire.backends._httpx2", "Httpx2SyncReader"),
     "Httpx2AsyncReader": ("zipwire.backends._httpx2", "Httpx2AsyncReader"),
     "AiohttpReader": ("zipwire.backends._aiohttp", "AiohttpReader"),

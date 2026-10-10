@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 from tests.conftest import (
+    has_aiobotocore,
     has_aiohttp,
     has_httpx2,
     has_requests,
@@ -642,6 +643,7 @@ class TestBackendsInit:
 
     def test_dir(self) -> None:
         names = dir(backends)
+        assert "AiobotocoreReader" in names
         assert "Httpx2SyncReader" in names
         assert "Httpx2AsyncReader" in names
         assert "AiohttpReader" in names
@@ -664,3 +666,8 @@ class TestBackendsInit:
     def test_aiohttp_import_error(self) -> None:
         with pytest.raises(ImportError, match="aiohttp"):
             backends.AiohttpReader  # noqa: B018
+
+    @pytest.mark.skipif(has_aiobotocore, reason="aiobotocore is installed")
+    def test_aiobotocore_import_error(self) -> None:
+        with pytest.raises(ImportError, match="aiobotocore"):
+            backends.AiobotocoreReader  # noqa: B018

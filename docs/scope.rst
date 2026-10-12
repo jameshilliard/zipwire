@@ -27,8 +27,13 @@ Standard ZIP features are covered: central directory and ZIP64 parsing for
 archives and entries beyond 4 GiB, reading an entry into memory, and
 streaming an entry to a synchronous or asynchronous destination.  The
 supported compression methods are ``STORED``, ``DEFLATED``, ``BZIP2``,
-``LZMA``, and ``ZSTANDARD`` (method 93), subject to the availability of the
+``LZMA``, and ``ZSTANDARD`` (methods 20 and 93), subject to the availability of the
 corresponding Python modules.
+
+Traditional ZipCrypto entries can be read with a bytes password supplied
+to ``read`` or ``read_into``, or set with ``setpassword``. Archive comments,
+prepended data, and ZIP64 end records outside the initial tail are also
+supported. See :doc:`api` for compatibility details and validation limits.
 
 **Python wheels** are a first-class use case:
 :class:`~zipwire.SyncRemoteWheel` and :class:`~zipwire.AsyncRemoteWheel`
@@ -49,7 +54,7 @@ Full ``zipfile`` compatibility
    modern archives produced by current mainstream tools and package
    builders, and makes no promise of matching :mod:`zipfile` for malformed
    or ambiguous archives.  Legacy filename encodings are supported only
-   through the explicit ``metadata_encoding`` argument; other legacy
+   through the explicit ``metadata_encoding`` argument; undocumented legacy
    quirks are out of scope.  Code that needs a general-purpose reader for
    arbitrary local archives should use :mod:`zipfile`.
 
@@ -64,12 +69,10 @@ Other transports (S3, FTP, ...)
    Note that zipwire is pre-1.0 and its public API is not stable yet, so
    third-party readers may need updates between minor releases.
 
-Encrypted archives
-   zipwire has no password or decryption API.  Traditional ZipCrypto is
-   cryptographically weak and should be considered broken.  WinZip AES is
-   stronger, but neither is supported or planned.  Package indexes normally
-   serve unencrypted wheels, and adding password handling would complicate an
-   API built around reading a few ranges from a public URL.
+AES and strong encryption
+   WinZip AES and PKWARE strong encryption are unsupported. Traditional
+   ZipCrypto is supported for reading existing archives, but it is
+   cryptographically weak and should be considered broken.
 
 ``httpx`` package
    zipwire's HTTP/2 backend uses httpx2, the Pydantic community fork of the
@@ -88,13 +91,6 @@ Other archive formats and write support
    zipwire is a read-only ZIP client.  It does not create, modify, repair, or
    repack archives, and it does not read tar, 7z, RAR, or similar formats.
    Such features belong in a separate package or tool.
-
-Legacy Zstandard method ID (20)
-   ZIP APPNOTE 6.3.7 briefly assigned Zstandard to compression method 20.
-   Version 6.3.8, revised fourteen days later, deprecated that ID and moved
-   Zstandard to method 93, which is the only one zipwire supports.  Archives
-   written during that short window -- or by tools that copied the draft --
-   are rare; reading them raises :exc:`~zipwire.UnsupportedCompression`.
 
 Have an idea?
 -------------

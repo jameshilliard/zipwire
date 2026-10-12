@@ -1,4 +1,4 @@
-"""Write decoded chunks completely, retrying short writes."""
+"""Write decoded chunks completely, with optional caller-provided checkpoints."""
 
 from __future__ import annotations
 
@@ -6,74 +6,67 @@ import typing
 from inspect import isawaitable
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Awaitable, Callable, Iterable, Iterator
 
     from zipwire._types import AsyncWritable, Writable
 
 
-def _write_steps(chunks: Iterable[bytes]) -> Generator[bytes, int | None, None]:
-    """Drive short-write retries, shared by the sync and async paths.
+def _write_count(written: object, length: int) -> int:
+    if written is None:
+        return length
+    if type(written) is not int or not 0 < written <= length:
+        raise OSError("write() returned an invalid byte count")
+    return written
 
-    Yields the next part to write and receives the result of
-    ``dest.write(part)`` back through ``send()``, advancing by the
-    accepted amount:
 
-    - ``None``: the whole part was accepted.
-    - an :class:`int` with ``0 < written <= len(part)``: the number of
-      bytes accepted.
-    - anything else, including a :class:`bool` success flag: raises
-      :exc:`OSError`.
-    """
+def _write_steps(dest: Writable, chunks: Iterable[bytes]) -> Iterator[None]:
     for chunk in chunks:
+        if not chunk:
+            yield
+            continue
         offset = 0
         write_size = len(chunk)
         while offset < len(chunk):
             part = chunk[offset : offset + write_size]
-            written = yield part
-            if written is None:
-                written = len(part)
-            # type() rather than isinstance(): bool is an int subclass,
-            # and a True/False success flag must not be misread as a count.
-            elif type(written) is not int or not 0 < written <= len(part):
-                raise OSError("write() returned an invalid byte count")
+            written = _write_count(dest.write(part), len(part))
             offset += written
+            # Retry short writes with smaller slices to avoid repeatedly
+            # copying a large remainder when only a few bytes are accepted.
             write_size = written
+            yield
 
 
 def write_all(dest: Writable, chunks: Iterable[bytes]) -> None:
     """Write every chunk, retrying partial writes."""
-    steps = _write_steps(chunks)
-    try:
-        part = next(steps)
-    except StopIteration:
-        return
-    while True:
-        result = dest.write(part)
-        try:
-            part = steps.send(result)
-        except StopIteration:
-            return
+    for _ in _write_steps(dest, chunks):
+        pass
 
 
-async def awrite_all(dest: Writable | AsyncWritable, chunks: Iterable[bytes]) -> None:
-    """Write every chunk, retrying partial writes and awaiting awaitables.
+async def awrite_all(
+    dest: Writable | AsyncWritable,
+    chunks: Iterable[bytes],
+    *,
+    checkpoint: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """Write every chunk, optionally yielding between decoding and write steps.
 
-    Awaiting the write result yields control on any event loop, so this
-    coroutine never calls loop-specific APIs such as ``asyncio.sleep(0)``
-    and works under asyncio, trio, or without an event loop at all.
+    Without a checkpoint callback this helper is event-loop independent.
+    Callers that need cooperative scheduling can supply their loop's checkpoint.
     """
-    steps = _write_steps(chunks)
-    try:
-        part = next(steps)
-    except StopIteration:
-        return
-    while True:
-        result = dest.write(part)
-        # Sync file writes return the byte count; skip the costlier
-        # awaitable probe for the common case.
-        if type(result) is not int and isawaitable(result):
-            result = await result
-        try:
-            part = steps.send(result)
-        except StopIteration:
-            return
+    for chunk in chunks:
+        if not chunk:
+            if checkpoint is not None:
+                await checkpoint()
+            continue
+        offset = 0
+        write_size = len(chunk)
+        while offset < len(chunk):
+            part = chunk[offset : offset + write_size]
+            result = dest.write(part)
+            if type(result) is not int and isawaitable(result):
+                result = await result
+            written = _write_count(result, len(part))
+            offset += written
+            write_size = written
+            if checkpoint is not None:
+                await checkpoint()

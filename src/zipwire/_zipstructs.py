@@ -24,9 +24,14 @@ from __future__ import annotations
 
 import inspect
 import struct
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, NewType, Self
-from zlib import crc32
+
+try:
+    from zlib import crc32
+except ImportError:  # pragma: no cover
+    from binascii import crc32
 
 from zipwire._constants import MAX_UINT16, MAX_UINT32, HeaderFlag
 from zipwire._errors import BadZipFile
@@ -522,7 +527,7 @@ class Zip64ExtendedInfo:
         compress_size: uint64_t | None = None
         header_offset: uint64_t | None = None
         disk_start: uint32_t | None = None
-        if cd.uncompressed_size == MAX_UINT32:
+        if cd.uncompressed_size in (MAX_UINT32, 0xFFFFFFFFFFFFFFFF):
             file_size = uint64_t(unpack("<Q", "File size"))
         if cd.compressed_size == MAX_UINT32:
             compress_size = uint64_t(unpack("<Q", "Compress size"))
@@ -575,4 +580,7 @@ class UnicodePathExtraField:
             raise BadZipFile("Corrupt unicode path extra field (0x7075): invalid utf-8") from e
         if "\0" in name:
             raise BadZipFile("Unicode path extra field (0x7075) name contains a null byte")
-        return cls(name) if name else None
+        if not name:
+            warnings.warn("Empty Unicode Path extra field", stacklevel=3)
+            return None
+        return cls(name)

@@ -184,8 +184,6 @@ def test_streaming_unsupported_method() -> None:
 
 
 def test_decompress_bzip2() -> None:
-    import bz2
-
     original = b"Hello, bzip2 World!" * 50
     compressed = bz2.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
@@ -194,8 +192,6 @@ def test_decompress_bzip2() -> None:
 
 
 def test_streaming_bzip2() -> None:
-    import bz2
-
     original = b"Streaming bzip2 data" * 100
     compressed = bz2.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
@@ -207,8 +203,6 @@ def test_streaming_bzip2() -> None:
 
 
 def test_streaming_bzip2_chunked() -> None:
-    import bz2
-
     original = b"ABCDEFGH" * 500
     compressed = bz2.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF

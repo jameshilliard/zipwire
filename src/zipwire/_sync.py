@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
-import contextlib
 import typing
+from contextlib import ExitStack
+from dataclasses import replace
 
 from zipwire._base import RemoteZipBase
 from zipwire._constants import PREFETCH_EXTRA, PREFETCH_THRESHOLD
 from zipwire._decompress import StreamingDecompressor, decompress
-from zipwire._errors import BadZipFile, FileTooLarge, RangeRequestUnsupported
-from zipwire._parser import find_eocd
+from zipwire._errors import BadZipFile, RangeRequestUnsupported
+from zipwire._parser import _ReadRequired, find_eocd
 from zipwire._write import write_all
-from zipwire._zipinfo import RemoteZipInfo
-from zipwire._zipstructs import LocalFileHeaderRecord
+from zipwire._zipstructs import EOCDRecord, LocalFileHeaderRecord
 
 if typing.TYPE_CHECKING:
+    import zipfile
+    from collections.abc import Callable
+
     from zipwire._types import SyncReader, Writable
 
 
@@ -69,9 +72,6 @@ class SyncRemoteZip(RemoteZipBase):
     def _ensure_loaded(self) -> None:
         """Fetch and parse the central directory.
 
-        Stores the parsed entries via ``_set_entries()`` and the initial
-        tail fetch via ``_store_tail()``.
-
         Raises:
             RuntimeError: If called more than once.
         """
@@ -87,115 +87,83 @@ class SyncRemoteZip(RemoteZipBase):
         if cl is None:
             raise RangeRequestUnsupported("Server did not return a Content-Length header")
         file_size = int(cl)
+        if file_size < EOCDRecord.FIXED_SIZE:
+            raise BadZipFile("File is not a zip file")
         fetch_size = min(file_size, self._tail_read_size(file_size))
         tail_start = max(0, file_size - fetch_size)
         tail, _ = self._reader.read_range(tail_start, file_size - tail_start)
-        if len(tail) != file_size - tail_start:
-            raise BadZipFile(
-                f"Archive tail fetch returned {len(tail)} of {file_size - tail_start} bytes"
-            )
+        if len(tail) != fetch_size:
+            raise BadZipFile(f"Archive tail fetch returned {len(tail)} of {fetch_size} bytes")
 
         # Step 2: Parse EOCD
-        eocd = find_eocd(tail, file_size)
+        records: dict[int, bytes] = {}
+        while True:
+            try:
+                eocd = find_eocd(tail, file_size, records=records)
+                break
+            except _ReadRequired as request:
+                data, _ = self._reader.read_range(request.offset, request.length)
+                if len(data) != request.length:
+                    raise BadZipFile("Truncated ZIP64 end record") from None
+                records[request.offset] = data
 
-        # Step 3: Fetch central directory and store parsed state
         self._validate_cd_bounds(file_size, eocd)
-        cd_data, _ = self._reader.read_range(eocd.cd_offset, eocd.cd_size)
+
+        # Step 3: Reuse the tail if it contains the complete directory.
+        cd_data = b""
+        if eocd.cd_size:
+            if eocd.cd_offset >= tail_start:
+                start = eocd.cd_offset - tail_start
+                cd_data = tail[start : start + eocd.cd_size]
+            else:
+                cd_data, _ = self._reader.read_range(eocd.cd_offset, eocd.cd_size)
+        if len(cd_data) != eocd.cd_size:
+            raise BadZipFile("Central directory is truncated")
         self._set_entries(cd_data, file_size, eocd)
+
         self._store_tail(tail_start, tail)
 
     def _resolve_entry(
         self,
-        name: str | RemoteZipInfo,
-    ) -> tuple[RemoteZipInfo, int, bytes | None] | None:
-        """Resolve *name* to a ZipInfo and compute the compressed data offset.
-
-        The local file header's filename is validated against the
-        central directory name, as ``zipfile.ZipFile.open()`` does.
-
-        Returns ``None`` for directory entries (no data to extract),
-        or ``(info, data_offset, prefetched)`` for file entries.
-        For small files (compressed size <= 50 KiB) the local header and
-        compressed data are fetched in a single request and *prefetched*
-        contains the compressed bytes.  Otherwise *prefetched* is ``None``.
-        """
-        info = name if isinstance(name, RemoteZipInfo) else self.getinfo(name)
-        if info.is_dir():
-            return None
-        self._validate_entry(info)
-
+        info: zipfile.ZipInfo,
+    ) -> tuple[zipfile.ZipInfo, int, bytes | None]:
+        """Validate the local header and optionally prefetch a small member."""
+        fetch_size = LocalFileHeaderRecord.FIXED_SIZE + PREFETCH_EXTRA
         if info.compress_size <= PREFETCH_THRESHOLD:
-            # Small file: fetch local header + compressed data in one request.
-            # Clamp to the archive end: the size comes from the central
-            # directory and must not turn into a request past the end.
-            fetch_size = LocalFileHeaderRecord.FIXED_SIZE + PREFETCH_EXTRA + info.compress_size
-            fetch_size = min(fetch_size, self.file_size - info.header_offset)
-            buf, _ = self._reader.read_range(info.header_offset, fetch_size)
-            local_header = LocalFileHeaderRecord.parse(buf)
-            data_start = LocalFileHeaderRecord.FIXED_SIZE + local_header.data_offset_past_header
-            data_offset = info.header_offset + data_start
-            if data_start + info.compress_size <= len(buf):
-                self._validate_data_region(info, data_offset)
-                self._check_local_filename(info, local_header.filename)
-                return info, data_offset, buf[data_start : data_start + info.compress_size]
-            # Rare: variable fields exceeded PREFETCH_EXTRA, fall through
-        else:
-            # Large file: fetch the header plus an allowance for its
-            # variable fields so the filename can be validated; the
-            # compressed data is fetched or streamed separately.
-            fetch_size = min(
-                LocalFileHeaderRecord.FIXED_SIZE + PREFETCH_EXTRA,
-                self.file_size - info.header_offset,
+            fetch_size += info.compress_size
+        fetch_size = min(fetch_size, self.file_size - info.header_offset)
+        buf, _ = self._reader.read_range(info.header_offset, fetch_size)
+        header = LocalFileHeaderRecord.parse(buf)
+        filename_end = self._check_local_header(info, header)
+        if len(buf) < filename_end:
+            filename, _ = self._reader.read_range(
+                info.header_offset + LocalFileHeaderRecord.FIXED_SIZE, header.filename_length
             )
-            buf, _ = self._reader.read_range(info.header_offset, fetch_size)
-            local_header = LocalFileHeaderRecord.parse(buf)
-            data_offset = (
-                info.header_offset
-                + LocalFileHeaderRecord.FIXED_SIZE
-                + local_header.data_offset_past_header
-            )
-
-        self._validate_data_region(info, data_offset)
-        self._check_local_filename(info, self._fetch_local_filename(info, local_header))
+            if len(filename) != header.filename_length:
+                raise BadZipFile(
+                    f"{info.filename!r}: local header filename fetch returned "
+                    f"{len(filename)} of {header.filename_length} bytes"
+                )
+            buf = buf[: LocalFileHeaderRecord.FIXED_SIZE] + filename
+            header = replace(header, filename=filename)
+        data_offset = self._validate_local_header(info, header)
+        start = data_offset - info.header_offset
+        if not info.compress_size or start + info.compress_size <= len(buf):
+            return info, data_offset, buf[start : start + info.compress_size]
         return info, data_offset, None
-
-    def _fetch_local_filename(
-        self,
-        info: RemoteZipInfo,
-        local_header: LocalFileHeaderRecord,
-    ) -> bytes | None:
-        """Return the raw local filename, fetching it if it was not prefetched.
-
-        ``_validate_data_region()`` must have passed for *info* first:
-        it bounds the local header's filename length by the archive
-        end, so the fetch here cannot go past it.
-
-        Raises:
-            BadZipFile: If the fetch returns fewer bytes than the local
-                header's filename length.
-        """
-        if local_header.filename is not None:
-            return local_header.filename
-        # Rare: the local filename exceeds the PREFETCH_EXTRA allowance.
-        offset = info.header_offset + LocalFileHeaderRecord.FIXED_SIZE
-        filename, _ = self._reader.read_range(offset, local_header.filename_length)
-        if len(filename) != local_header.filename_length:
-            raise BadZipFile(
-                f"{info.filename!r}: local header filename fetch returned "
-                f"{len(filename)} of {local_header.filename_length} bytes"
-            )
-        return filename
 
     def read(
         self,
-        name: str | RemoteZipInfo,
+        name: str | zipfile.ZipInfo,
+        pwd: bytes | None = None,
         *,
         max_file_size: int | None = None,
     ) -> bytes:
         """Read and decompress a file from the archive.
 
         Args:
-            name: Filename string or RemoteZipInfo object.
+            name: Filename string or ZipInfo object.
+            pwd: Password for traditional ZIP encryption; defaults to setpassword().
             max_file_size: Optional limit on uncompressed size in bytes.
                 Raises :exc:`~zipwire.FileTooLarge` if the entry's
                 ``file_size`` exceeds this limit.
@@ -206,42 +174,33 @@ class SyncRemoteZip(RemoteZipBase):
         .. warning::
 
             This method loads the entire decompressed file into memory.
-            It checks the entry's declared ``file_size`` against
-            *max_file_size*, but a crafted archive may lie about its
-            uncompressed size.  Use :meth:`read_into` for defence in
-            depth: it enforces the size limit during decompression.
-            The decompressed size is verified against the declared
-            ``file_size`` and raises :exc:`~zipwire.SizeMismatch` when
-            they differ.  A local file header whose filename differs
-            from the central directory name raises
-            :exc:`~zipwire.BadZipFile`, as ``zipfile.ZipFile.open()``
-            does.
+            The declared size is checked against *max_file_size* and
+            output is limited to the declared size, as in zipfile.
+            Use :meth:`read_into` to avoid buffering the
+            complete compressed and decompressed contents.
         """
-        resolved = self._resolve_entry(name)
-        if resolved is None:
-            return b""
-        info, data_offset, prefetched = resolved
-        if max_file_size is not None and info.file_size > max_file_size:
-            raise FileTooLarge(info.filename, info.file_size, max_file_size)
+        info = self._entry_info(name, max_file_size=max_file_size)
+        info, data_offset, prefetched = self._resolve_entry(info)
+        password, encryption_check = self._password(info, pwd)
         if prefetched is None:
             prefetched, _ = self._reader.read_range(data_offset, info.compress_size)
-            if len(prefetched) != info.compress_size:
-                raise BadZipFile(
-                    f"{info.filename!r}: data fetch returned {len(prefetched)} "
-                    f"of {info.compress_size} bytes"
-                )
         return decompress(
             prefetched,
             info.compress_type,
             info.file_size,
             info.CRC,
+            filename=info.orig_filename,
+            compressed_size=info.compress_size,
+            pwd=password,
+            encryption_check=encryption_check,
         )
 
     def read_into(
         self,
-        name: str | RemoteZipInfo,
+        name: str | zipfile.ZipInfo,
         dest: Writable,
         *,
+        pwd: bytes | None = None,
         max_file_size: int | None = None,
     ) -> None:
         """Decompress a file from the archive into a writable destination.
@@ -249,63 +208,44 @@ class SyncRemoteZip(RemoteZipBase):
         Unlike :meth:`read`, this truly streams: the compressed payload is
         fetched in chunks via :meth:`stream_range` and each chunk is
         decompressed and written immediately, keeping peak memory low.
-        Decompressed output is handed to *dest* in chunks of at most
-        2 MiB, even when the entry expands far beyond its compressed size.
 
-        The streaming decompressor also enforces *max_file_size* during
-        decompression, aborting if the actual output exceeds the limit
-        regardless of what the entry metadata claims.  A compressed
-        stream that ends prematurely raises
-        :exc:`~zipwire.TruncatedStream`.  Decompressed output beyond the
-        declared ``file_size`` aborts the transfer and raises
-        :exc:`~zipwire.SizeMismatch`; a shortfall is detected once the
-        stream ends.
-
-        Writes are checked: a destination that accepts fewer bytes than
-        given is retried with the remaining bytes, while a byte count that
-        is not an :class:`int`, or is zero, negative, or oversized, raises
-        :exc:`OSError`.  A ``write()`` that returns ``None`` is assumed to
-        have accepted the whole chunk.
-
-        A local file header whose filename differs from the central
-        directory name raises :exc:`~zipwire.BadZipFile`, as
-        ``zipfile.ZipFile.open()`` does.
-
-        The caller owns *dest*: this method does not flush or close it.
-        Errors may leave partial output; only a successful return indicates
-        that CRC-32 verification passed.
-
-        The streamed response is closed when extraction finishes or fails.
-        If closing the stream raises, the close error propagates and may
-        mask the original exception, which remains available in its
-        ``__context__`` chain.
+        Output is limited to the declared size, as in zipfile, and checked
+        against the entry's CRC. *max_file_size* limits the declared size
+        before any member data is fetched.
+        Compressed members continue decoding to validate the encoded data,
+        discarding excess output in bounded chunks.
 
         Args:
-            name: Filename string or RemoteZipInfo object.
+            name: Filename string or ZipInfo object.
+            pwd: Password for traditional ZIP encryption; defaults to setpassword().
             dest: A writable file-like object (e.g. ``io.BytesIO``, open file).
             max_file_size: Optional limit on uncompressed size in bytes.
                 Raises :exc:`~zipwire.FileTooLarge` if the entry's
-                ``file_size`` exceeds this limit, or if the actual
-                decompressed output exceeds it.
+                ``file_size`` exceeds this limit.
         """
-        resolved = self._resolve_entry(name)
-        if resolved is None:
-            return
-        info, data_offset, prefetched = resolved
-        if max_file_size is not None and info.file_size > max_file_size:
-            raise FileTooLarge(info.filename, info.file_size, max_file_size)
+        info = self._entry_info(name, max_file_size=max_file_size)
+        info, data_offset, prefetched = self._resolve_entry(info)
+        password, encryption_check = self._password(info, pwd)
         sd = StreamingDecompressor(
             info.compress_type,
             info.CRC,
-            filename=info.filename,
+            filename=info.orig_filename,
             max_output_size=max_file_size,
             expected_size=info.file_size,
+            compressed_size=info.compress_size,
+            pwd=password,
+            encryption_check=encryption_check,
         )
         if prefetched is not None:
             write_all(dest, sd.feed_chunks(prefetched))
         else:
             stream = self._reader.stream_range(data_offset, info.compress_size)
-            with contextlib.closing(stream):
+            with ExitStack() as cleanup:
+                close: Callable[[], object] | None = getattr(stream, "close", None)
+                if close is not None:
+                    cleanup.callback(close)
                 for chunk in stream:
                     write_all(dest, sd.feed_chunks(chunk))
+                    if sd.eof:
+                        break
         sd.finish()

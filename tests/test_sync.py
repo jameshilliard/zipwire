@@ -503,7 +503,7 @@ class ShortCdReader(MockSyncReader):
 
 
 class ShortFilenameReader(MockSyncReader):
-    """Reader whose fourth (local header filename) read_range is short."""
+    """Reader whose third (local header filename) read_range is short."""
 
     def read_range(
         self,
@@ -511,7 +511,7 @@ class ShortFilenameReader(MockSyncReader):
         length: int,
     ) -> tuple[bytes, MockHeaders]:
         data, headers = super().read_range(offset, length)
-        if self.read_count == 4:
+        if self.read_count == 3:
             data = data[:-1]
         return data, headers
 
@@ -529,7 +529,10 @@ class TestHardening:
     def test_encrypted_entry_rejected(self, stored_zip: bytes) -> None:
         data = _or_cd_flags(stored_zip, HeaderFlag.ENCRYPTED)
         reader = MockSyncReader(data)
-        with SyncRemoteZip(reader) as rz, pytest.raises(UnsupportedFeature, match="encrypted"):
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(RuntimeError, match="password is required"),
+        ):
             rz.read("hello.txt")
 
     def test_patched_data_rejected(self, stored_zip: bytes) -> None:
@@ -543,9 +546,18 @@ class TestHardening:
         reader = MockSyncReader(data)
         with (
             SyncRemoteZip(reader) as rz,
-            pytest.raises(UnsupportedFeature, match="strong encryption"),
+            pytest.raises(UnsupportedFeature, match="Strong ZIP encryption"),
         ):
             rz.read("hello.txt")
+
+    def test_encrypted_entry_requires_password_by_read_into(self, stored_zip: bytes) -> None:
+        data = _or_cd_flags(stored_zip, HeaderFlag.ENCRYPTED)
+        reader = MockSyncReader(data)
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(RuntimeError, match="password is required"),
+        ):
+            rz.read_into("hello.txt", io.BytesIO())
 
     def test_header_offset_beyond_archive(self, stored_zip: bytes) -> None:
         buf = bytearray(stored_zip)
@@ -554,7 +566,9 @@ class TestHardening:
         reader = MockSyncReader(bytes(buf))
         with (
             SyncRemoteZip(reader) as rz,
-            pytest.raises(BadZipFile, match="beyond the end of the archive"),
+            pytest.raises(
+                BadZipFile, match=r"outside the file data|central directory offset or size"
+            ),
         ):
             rz.read("hello.txt")
 
@@ -565,7 +579,7 @@ class TestHardening:
         offset = cd_entry_offset(stored_zip, 0)
         struct.pack_into("<I", buf, offset + 20, len(stored_zip))
         reader = MockSyncReader(bytes(buf))
-        with SyncRemoteZip(reader) as rz, pytest.raises(BadZipFile, match="beyond the end"):
+        with SyncRemoteZip(reader) as rz, pytest.raises(BadZipFile, match="outside the file data"):
             rz.read("hello.txt")
 
     def test_overlapped_entry_rejected(self, stored_zip: bytes) -> None:
@@ -573,7 +587,7 @@ class TestHardening:
         # local header, but stays inside the archive.
         buf = bytearray(stored_zip)
         offset = cd_entry_offset(stored_zip, 0)
-        struct.pack_into("<I", buf, offset + 20, 100)
+        struct.pack_into("<I", buf, offset + 20, 20)
         reader = MockSyncReader(bytes(buf))
         with SyncRemoteZip(reader) as rz, pytest.raises(BadZipFile, match="Overlapped entries"):
             rz.read("hello.txt")
@@ -581,7 +595,7 @@ class TestHardening:
     def test_overlapped_entry_rejected_by_read_into(self, stored_zip: bytes) -> None:
         buf = bytearray(stored_zip)
         offset = cd_entry_offset(stored_zip, 0)
-        struct.pack_into("<I", buf, offset + 20, 100)
+        struct.pack_into("<I", buf, offset + 20, 20)
         reader = MockSyncReader(bytes(buf))
         with (
             SyncRemoteZip(reader) as rz,
@@ -620,6 +634,7 @@ class TestHardening:
             SyncRemoteZip(reader) as rz,
             pytest.warns(UserWarning, match="Overlapped entries") as caught,
         ):
+            assert rz.read(rz.infolist()[0]) == b"same data"
             assert rz.read("dup.txt") == b"same data"
         # The warning is attributed to the caller, not to zipwire.
         assert caught[0].filename == __file__
@@ -696,7 +711,7 @@ class TestHardening:
         reader = MockSyncReader(bytes(buf))
         with (
             SyncRemoteZip(reader) as rz,
-            pytest.raises(BadZipFile, match="beyond the end"),
+            pytest.raises(BadZipFile, match="outside the file data"),
         ):
             rz.read("hello.txt")
 
@@ -734,7 +749,9 @@ class TestHardening:
         data = bytes(buf)
         reader = MockSyncReader(data)
         with (
-            pytest.raises(BadZipFile, match="beyond the end of the archive"),
+            pytest.raises(
+                BadZipFile, match=r"outside the file data|central directory offset or size"
+            ),
             SyncRemoteZip(reader),
         ):
             pass
@@ -750,35 +767,43 @@ class TestHardening:
         reader = MockSyncReader(data)
         with (
             SyncRemoteZip(reader) as rz,
-            pytest.raises(BadZipFile, match="beyond the end of the archive"),
+            pytest.raises(
+                BadZipFile, match=r"outside the file data|central directory offset or size"
+            ),
         ):
             rz.read("hello.txt")
         assert all(offset + length <= len(data) for offset, length in reader.requests)
 
-    def test_cd_beyond_archive_rejected_on_load(self, stored_zip: bytes) -> None:
+    def test_invalid_relative_member_offset_rejected(self, stored_zip: bytes) -> None:
         buf = bytearray(stored_zip)
         eocd_pos = buf.rfind(b"PK\x05\x06")
         cd_offset = struct.unpack_from("<I", buf, eocd_pos + 16)[0]
         struct.pack_into("<I", buf, eocd_pos + 16, cd_offset + 1000)
         reader = MockSyncReader(bytes(buf))
         with (
-            pytest.raises(BadZipFile, match="beyond the end of the archive"),
-            SyncRemoteZip(reader),
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(
+                BadZipFile, match=r"outside the file data|central directory offset or size"
+            ),
         ):
-            pass
+            rz.read("hello.txt")
+        assert reader.requests == [(0, len(buf))]
 
     def test_short_tail_read_rejected(self, stored_zip: bytes) -> None:
         reader = ShortTailReader(stored_zip)
         with pytest.raises(BadZipFile, match="tail fetch returned"), SyncRemoteZip(reader):
             pass
 
-    def test_short_cd_read_rejected(self, large_file_zip: bytes) -> None:
-        reader = ShortCdReader(large_file_zip)
+    def test_short_cd_read_rejected(self) -> None:
+        # Keep the directory larger than the tail so a separate fetch is needed.
+        data = make_zip({f"file_{i:04d}" + "x" * 64: b"" for i in range(1000)})
+        reader = ShortCdReader(data)
         with (
-            pytest.raises(BadZipFile, match="Central directory fetch returned"),
+            pytest.raises(BadZipFile, match="Central directory is truncated"),
             SyncRemoteZip(reader),
         ):
             pass
+        assert reader.read_count == 2
 
     def test_short_local_filename_fetch_rejected(self) -> None:
         # The extra fetch for a filename longer than the prefetch

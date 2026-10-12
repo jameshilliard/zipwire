@@ -7,6 +7,7 @@ import struct
 import typing
 import zipfile
 
+import anyio
 import pytest
 
 from tests.conftest import (
@@ -16,12 +17,13 @@ from tests.conftest import (
     make_zip,
 )
 from zipwire import AsyncRemoteZip, EOCDInfo
-from zipwire._constants import STREAM_CHUNK_SIZE
+from zipwire._constants import STREAM_CHUNK_SIZE, HeaderFlag
 from zipwire._errors import (
     BadZipFile,
     FileNotFoundInZip,
     FileTooLarge,
     RangeRequestUnsupported,
+    UnsupportedFeature,
 )
 from zipwire._parser import find_eocd
 from zipwire._zipinfo import RemoteZipInfo
@@ -316,15 +318,12 @@ class TestAsyncRemoteZip:
         assert bytes(output) == content
         assert max(sizes) <= STREAM_CHUNK_SIZE
 
-    def test_read_into_is_loop_agnostic(self) -> None:
-        """read_into must not use event-loop primitives such as asyncio.sleep(0).
-
-        A checkpoint like asyncio.sleep(0) passes under asyncio but raises
-        RuntimeError on other event loops such as trio.  Driving the
-        coroutine by hand, with no event loop at all, detects any await
-        that needs one: the extraction must run to completion without ever
-        suspending, for both sync and async destinations.
-        """
+    @pytest.mark.parametrize("backend", ["asyncio", "trio"])
+    @pytest.mark.parametrize(
+        "method", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA]
+    )
+    def test_reads_are_loop_agnostic(self, backend: str, method: int) -> None:
+        """Buffered reads and streaming checkpoints work on both event loops."""
         content = b"\0" * (3 * STREAM_CHUNK_SIZE)
 
         class SyncDestination:
@@ -343,22 +342,16 @@ class TestAsyncRemoteZip:
                 self.data.extend(chunk)
                 return len(chunk)
 
-        archive_data = make_zip({"entry.bin": content}, compression=zipfile.ZIP_DEFLATED)
+        archive_data = make_zip({"entry.bin": content}, compression=method)
         for destination in (SyncDestination(), AsyncDestination()):
-            coroutine = self._extract(archive_data, destination)
-            try:
-                coroutine.send(None)
-            except StopIteration:
-                pass
-            else:
-                coroutine.close()
-                pytest.fail("read_into suspended on an event-loop primitive")
+            anyio.run(self._extract, archive_data, destination, backend=backend)
             assert bytes(destination.data) == content
 
     @staticmethod
     async def _extract(archive_data: bytes, destination: typing.Any) -> None:
         async with AsyncRemoteZip(MockAsyncReader(archive_data)) as rz:
             await rz.read_into("entry.bin", destination)
+            assert await rz.read("entry.bin") == bytes(destination.data)
 
     async def test_read_into_closes_stream_on_error(self, large_file_zip: bytes) -> None:
         """Close the response generator when writing fails mid-stream."""
@@ -462,7 +455,7 @@ class ShortTailAsyncReader(MockAsyncReader):
 
 
 class ShortFilenameAsyncReader(MockAsyncReader):
-    """Reader whose fourth (local header filename) read_range is short."""
+    """Reader whose third (local header filename) read_range is short."""
 
     async def read_range(
         self,
@@ -470,7 +463,7 @@ class ShortFilenameAsyncReader(MockAsyncReader):
         length: int,
     ) -> tuple[bytes, MockHeaders]:
         data, headers = await super().read_range(offset, length)
-        if self.read_count == 4:
+        if self.read_count == 3:
             data = data[:-1]
         return data, headers
 
@@ -522,12 +515,34 @@ class TestHardening:
             with pytest.raises(BadZipFile, match="differ"):
                 await rz.read(name)
 
+    async def test_encrypted_entry_requires_password(self, stored_zip: bytes) -> None:
+        buf = bytearray(stored_zip)
+        eocd = find_eocd(stored_zip, len(stored_zip))
+        offset = eocd.cd_offset
+        flags = struct.unpack_from("<H", buf, offset + 8)[0]
+        struct.pack_into("<H", buf, offset + 8, flags | HeaderFlag.ENCRYPTED)
+        reader = MockAsyncReader(bytes(buf))
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(RuntimeError, match="password is required"):
+                await rz.read("hello.txt")
+
+    async def test_patched_data_rejected(self, stored_zip: bytes) -> None:
+        buf = bytearray(stored_zip)
+        eocd = find_eocd(stored_zip, len(stored_zip))
+        offset = eocd.cd_offset
+        flags = struct.unpack_from("<H", buf, offset + 8)[0]
+        struct.pack_into("<H", buf, offset + 8, flags | HeaderFlag.COMPRESSED_PATCHED_DATA)
+        reader = MockAsyncReader(bytes(buf))
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(UnsupportedFeature, match="patched data"):
+                await rz.read("hello.txt")
+
     async def test_overlapped_entry_rejected(self, stored_zip: bytes) -> None:
         # Inflate compress_size so the data runs past the next entry's
         # local header, but stays inside the archive.
         buf = bytearray(stored_zip)
         eocd = find_eocd(stored_zip, len(stored_zip))
-        struct.pack_into("<I", buf, eocd.cd_offset + 20, 100)
+        struct.pack_into("<I", buf, eocd.cd_offset + 20, 20)
         reader = MockAsyncReader(bytes(buf))
         async with AsyncRemoteZip(reader) as rz:
             with pytest.raises(BadZipFile, match="Overlapped entries"):
@@ -541,7 +556,9 @@ class TestHardening:
         struct.pack_into("<I", buf, eocd_pos + 12, 0xFFFFFF00)
         data = bytes(buf)
         reader = MockAsyncReader(data)
-        with pytest.raises(BadZipFile, match="beyond the end of the archive"):
+        with pytest.raises(
+            BadZipFile, match=r"outside the file data|central directory offset or size"
+        ):
             async with AsyncRemoteZip(reader):
                 pass
         assert reader.requests == [(0, len(data))]
@@ -555,19 +572,24 @@ class TestHardening:
         data = bytes(buf)
         reader = MockAsyncReader(data)
         async with AsyncRemoteZip(reader) as rz:
-            with pytest.raises(BadZipFile, match="beyond the end of the archive"):
+            with pytest.raises(
+                BadZipFile, match=r"outside the file data|central directory offset or size"
+            ):
                 await rz.read("hello.txt")
         assert all(offset + length <= len(data) for offset, length in reader.requests)
 
-    async def test_cd_beyond_archive_rejected_on_load(self, stored_zip: bytes) -> None:
+    async def test_invalid_relative_member_offset_rejected(self, stored_zip: bytes) -> None:
         buf = bytearray(stored_zip)
         eocd_pos = buf.rfind(b"PK\x05\x06")
         cd_offset = struct.unpack_from("<I", buf, eocd_pos + 16)[0]
         struct.pack_into("<I", buf, eocd_pos + 16, cd_offset + 1000)
         reader = MockAsyncReader(bytes(buf))
-        with pytest.raises(BadZipFile, match="beyond the end of the archive"):
-            async with AsyncRemoteZip(reader):
-                pass
+        with pytest.raises(
+            BadZipFile, match=r"outside the file data|central directory offset or size"
+        ):
+            async with AsyncRemoteZip(reader) as rz:
+                await rz.read("hello.txt")
+        assert reader.requests == [(0, len(buf))]
 
     async def test_short_tail_read_rejected(self, stored_zip: bytes) -> None:
         reader = ShortTailAsyncReader(stored_zip)

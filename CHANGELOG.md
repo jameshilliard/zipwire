@@ -21,6 +21,39 @@ releases; they are marked **BREAKING**.
 - The Unicode Path extra field (0x7075) is now honored: a CRC-32-matched
   version 1 field replaces the entry name with its UTF-8 form, as stdlib
   `zipfile` does.
+- Traditional ZipCrypto entries support `pwd` on `read` and `read_into`,
+  and `setpassword()` sets a default password. AES remains unsupported.
+- Zstandard entries using legacy method 20 are supported when Python's
+  `compression.zstd` module is available.
+- Archive objects expose `comment`; prepended data and ZIP64 end records
+  outside the initial tail are supported with bounded range requests.
+- `EOCDInfo.archive_offset` exposes the adjustment for prepended data;
+  `cd_offset` and member offsets are absolute positions in the archive.
+
+### Changed
+
+- **BREAKING:** Archive reads limit output to the declared size and check
+  its CRC, as `zipfile` does. Callers must catch `BadZipFile` for corrupt
+  output instead of relying on `SizeMismatch` for size discrepancies.
+- `max_file_size` rejects oversized members before fetching their headers
+  or payload, including entries already cached by wheel readers.
+- **BREAKING:** `CRCMismatch` also inherits `BadZipFile`, and
+  `TruncatedStream` inherits both `BadZipFile` and `EOFError`. Review broad
+  exception handlers that previously let these errors propagate.
+- **BREAKING:** Unsupported features also raise `NotImplementedError`;
+  missing optional compression modules raise `RuntimeError`. Update
+  exception handlers for unavailable codecs accordingly.
+- AnyIO is a runtime dependency; async decoding and partial-write retries
+  yield on asyncio and Trio, including reads served entirely from a cache.
+
+### Fixed
+
+- Entry validation follows `zipfile`'s order for local signatures, flags,
+  names, extents, and passwords, while retaining archive range bounds.
+- Repeated ZIP64 extra fields and empty Unicode Path fields follow
+  `zipfile`'s metadata handling and warnings.
+- Async file readers wait for active worker operations before propagating
+  cancellation, so cleanup cannot close a file still being accessed.
 
 ### Security
 
@@ -34,6 +67,10 @@ releases; they are marked **BREAKING**.
 - EOCD, central directory, and local file header parsing now use the
   declarative record types in `zipwire._zipstructs`; `zipwire._constants`
   keeps only the integer bounds, fetch sizes, and compression methods.
+- Buffered and streamed reads share an incremental decoder; output beyond
+  the declared size is discarded in bounded chunks while detecting errors.
+- Archive loading reuses central-directory bytes from the initial tail;
+  wheel reads use actual local-header lengths to reuse cached members.
 
 ## 0.5.0 - 2026-11-12
 

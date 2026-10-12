@@ -11,7 +11,7 @@ import pytest
 from tests.conftest import MockAsyncReader, MockSyncReader
 from zipwire import AsyncRemoteWheel, SyncRemoteWheel
 from zipwire._constants import HeaderFlag
-from zipwire._errors import BadZipFile, UnsupportedFeature
+from zipwire._errors import BadZipFile
 from zipwire._parser import find_eocd
 from zipwire._wheel import _dist_info_from_url
 from zipwire._zipstructs import CentralDirHeaderRecord, LocalFileHeaderRecord
@@ -380,7 +380,7 @@ def _set_last_local_filename_length(data: bytes, fn_len: int) -> bytes:
 class TestWheelHardening:
     """The wheel tail-buffer fast path applies the same entry checks."""
 
-    def test_encrypted_entry_rejected(self) -> None:
+    def test_encrypted_entry_requires_password(self) -> None:
         """Encrypted dist-info entry is rejected when served from the tail."""
         data, filename = _make_wheel()
         reader = MockSyncReader(
@@ -389,7 +389,7 @@ class TestWheelHardening:
         )
         with (
             SyncRemoteWheel(reader) as whl,
-            pytest.raises(UnsupportedFeature, match="encrypted"),
+            pytest.raises(RuntimeError, match="password is required"),
         ):
             whl.read(f"{whl.dist_info_dir}RECORD")
 
@@ -403,9 +403,21 @@ class TestWheelHardening:
         reader = MockSyncReader(corrupted, url=f"https://example.com/{filename}")
         with (
             SyncRemoteWheel(reader) as whl,
-            pytest.raises(BadZipFile, match="Overlapped entries"),
+            pytest.raises(BadZipFile, match="outside the file data"),
         ):
             whl.read(f"{whl.dist_info_dir}RECORD")
+
+    @pytest.mark.asyncio
+    async def test_async_encrypted_entry_requires_password(self) -> None:
+        """The async wheel applies the entry checks on the tail fast path."""
+        data, filename = _make_wheel()
+        reader = MockAsyncReader(
+            _set_last_cd_flags(data, HeaderFlag.ENCRYPTED),
+            url=f"https://example.com/{filename}",
+        )
+        async with AsyncRemoteWheel(reader) as whl:
+            with pytest.raises(RuntimeError, match="password is required"):
+                await whl.read(f"{whl.dist_info_dir}RECORD")
 
     @pytest.mark.asyncio
     async def test_async_overlapped_entry_rejected(self) -> None:
@@ -413,7 +425,7 @@ class TestWheelHardening:
         corrupted = _inflate_last_cd_compress_size(data, 30)
         reader = MockAsyncReader(corrupted, url=f"https://example.com/{filename}")
         async with AsyncRemoteWheel(reader) as whl:
-            with pytest.raises(BadZipFile, match="Overlapped entries"):
+            with pytest.raises(BadZipFile, match="outside the file data"):
                 await whl.read(f"{whl.dist_info_dir}RECORD")
 
     def test_local_name_mismatch_rejected(self) -> None:
@@ -439,7 +451,7 @@ class TestWheelHardening:
         reader = MockSyncReader(corrupted, url=f"https://example.com/{filename}")
         with (
             SyncRemoteWheel(reader) as whl,
-            pytest.raises(BadZipFile, match="beyond the end"),
+            pytest.raises(BadZipFile, match="outside the file data"),
         ):
             whl.read(f"{whl.dist_info_dir}RECORD")
 

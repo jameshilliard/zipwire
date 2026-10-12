@@ -7,7 +7,9 @@ import io
 import typing
 import zipfile
 from random import Random
+from zlib import crc32
 
+import anyio
 import pytest
 
 from tests.conftest import (
@@ -68,6 +70,7 @@ class TrackingReader(MockAsyncReader):
         zipfile.ZIP_STORED,
         zipfile.ZIP_DEFLATED,
         zipfile.ZIP_BZIP2,
+        zipfile.ZIP_LZMA,
         pytest.param(getattr(zipfile, "ZIP_ZSTANDARD", 93), marks=needs_zstd),
     ],
 )
@@ -125,9 +128,10 @@ async def test_writer_returning_non_awaitable(stored_zip: bytes) -> None:
     assert destination.data == b"Hello, World!"
 
 
-async def test_writer_returning_awaitable_int() -> None:
+@pytest.mark.parametrize("size", [100, 70_000])
+async def test_writer_returning_awaitable_int(size: int) -> None:
     """Await int subclasses instead of treating their value as a completed write."""
-    content = b"Hello, World!"
+    content = Random(0).randbytes(size)
     awaited_bytes = 0
 
     class AwaitableCount(int):
@@ -326,25 +330,38 @@ async def test_crc_failure_propagates(stored_zip: bytes) -> None:
 
 
 @pytest.mark.parametrize("size", [100, 70_000])
-async def test_actual_output_limit(size: int) -> None:
-    """Check actual output when the central directory understates its size."""
+async def test_declared_size_caps_async_output(size: int) -> None:
+    """Truncate to the declared size and verify the returned bytes' CRC."""
     reader = TrackingReader(make_zip({"entry.bin": b"x" * size}))
     destination = AsyncDestination()
     async with AsyncRemoteZip(reader) as archive:
         info = archive.getinfo("entry.bin")
         info.file_size = 1
-        with pytest.raises(FileTooLarge):
-            await archive.read_into(info, destination, max_file_size=50)
-        assert not destination.data
+        info.CRC = crc32(b"x")
+        await archive.read_into(info, destination, max_file_size=50)
+        assert destination.data == b"x"
         if size == 70_000:
             assert reader.stream_closed
 
 
+@pytest.mark.parametrize("size", [100, 70_000])
+async def test_async_destination_size_limit(size: int) -> None:
+    """Reject oversized entries before fetching member data or writing."""
+    reader = TrackingReader(make_zip({"entry.bin": b"x" * size}))
+    destination = AsyncDestination()
+    async with AsyncRemoteZip(reader) as archive:
+        read_count = reader.read_count
+        with pytest.raises(FileTooLarge):
+            await archive.read_into("entry.bin", destination, max_file_size=50)
+        assert reader.read_count == read_count
+        assert reader.chunks_read == 0
+        assert not destination.data
+
+
 @needs_anyio
 async def test_anyio_file(stored_zip: bytes, tmp_path: Path) -> None:
-    """Exercise a real async file writer without a runtime dependency."""
-    import anyio
-
+    """Exercise a real async file writer."""
+    assert anyio is not None
     path = tmp_path / "output.txt"
     async with AsyncRemoteZip(MockAsyncReader(stored_zip)) as archive:
         async with await anyio.open_file(path, "wb") as destination:

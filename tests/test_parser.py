@@ -109,6 +109,20 @@ class TestFindEocd:
         assert eocd.cd_entry_count == 1
         assert eocd.comment == b"This is a ZIP comment"
 
+    @pytest.mark.parametrize("field", [5, 6])
+    def test_signature_in_eocd_field(self, field: int) -> None:
+        signature_value = int.from_bytes(b"PK\x05\x06", "little")
+        cd_size = signature_value if field == 5 else 50
+        cd_offset = signature_value if field == 6 else 100
+        record = struct.pack("<4s4H2IH", b"PK\x05\x06", 0, 0, 1, 1, cd_size, cd_offset, 0)
+        tail = b"\0" * 20 + record
+        file_size = cd_offset + cd_size + len(record)
+        info = find_eocd(tail, file_size)
+        assert info.cd_size == cd_size
+        assert info.cd_offset == cd_offset
+        assert info.archive_offset == 0
+        assert info.comment == b""
+
     def test_trailing_data_tolerated(self, stored_zip: bytes) -> None:
         """Data appended after the EOCD is ignored, as in ``zipfile``."""
         tail = stored_zip + b"appended JUNK"
@@ -152,13 +166,13 @@ class TestFindEocd:
     def test_zip64_record_size_mismatch(self) -> None:
         """Record size field does not match the space before the locator."""
         tail, file_size = _make_zip64_tail(record_size=45)
-        with pytest.raises(BadZipFile, match="Corrupt zip64 end of central directory record"):
+        with pytest.raises(BadZipFile, match="Invalid ZIP64 EOCD record size"):
             find_eocd(tail, file_size)
 
     def test_zip64_cd_gap_before_record(self) -> None:
         """Central directory does not end where the ZIP64 EOCD record begins."""
         tail, file_size = _make_zip64_tail(cd_gap=10)
-        with pytest.raises(BadZipFile, match="Corrupt zip64 end of central directory record"):
+        with pytest.raises(BadZipFile, match="Invalid ZIP64 central directory offset or size"):
             find_eocd(tail, file_size)
 
     def test_zip64_record_after_locator(self) -> None:
@@ -173,7 +187,7 @@ class TestFindEocd:
             1,
         )
         tail = b"\x00" * 56 + locator + _sentinel_eocd()
-        with pytest.raises(BadZipFile, match="Corrupt zip64 end of central directory locator"):
+        with pytest.raises(BadZipFile, match="Invalid ZIP64 EOCD locator offset"):
             find_eocd(tail, file_size)
 
     def test_zip64_locator_not_found(self) -> None:
@@ -181,7 +195,7 @@ class TestFindEocd:
         # Regular EOCD with sentinel triggering ZIP64 path, but only EOCD data
         eocd = _sentinel_eocd()
         # tail is exactly the EOCD - no room for locator before it
-        with pytest.raises(BadZipFile, match="locator not found"):
+        with pytest.raises(BadZipFile, match="central directory offset"):
             find_eocd(eocd, len(eocd))
 
     def test_zip64_eocd_outside_tail(self) -> None:
@@ -203,7 +217,7 @@ class TestParseCentralDirectory:
     def test_stored_zip(self, stored_zip: bytes) -> None:
         eocd = find_eocd(stored_zip, len(stored_zip))
         cd_data = stored_zip[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = list(parse_central_directory(cd_data))
         assert len(entries) == 2
         filenames = [e.filename for e in entries]
         assert b"hello.txt" in filenames
@@ -212,7 +226,7 @@ class TestParseCentralDirectory:
     def test_entry_fields(self, stored_zip: bytes) -> None:
         eocd = find_eocd(stored_zip, len(stored_zip))
         cd_data = stored_zip[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = list(parse_central_directory(cd_data))
 
         hello_entry = next(e for e in entries if e.filename == b"hello.txt")
         assert hello_entry.compression_method == 0  # STORED

@@ -26,6 +26,7 @@ class CompressionMethod(IntEnum):
     DEFLATED = 8  # zipfile.ZIP_DEFLATED
     BZIP2 = 12  # zipfile.ZIP_BZIP2
     LZMA = 14  # zipfile.ZIP_LZMA
+    ZSTANDARD_LEGACY = 20
     ZSTANDARD = 93  # zipfile.ZIP_ZSTANDARD (3.14+)
 
 

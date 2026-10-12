@@ -1,163 +1,140 @@
-"""Decompression and CRC verification for ZIP entries."""
+"""Incremental ZIP decompression, decryption, and CRC verification."""
 
 from __future__ import annotations
 
-import asyncio
 import io
 import typing
-import zlib
+
+from anyio.lowlevel import checkpoint
+
+try:
+    import zlib
+    from zlib import crc32
+except ImportError:  # pragma: no cover
+    from binascii import crc32
+
+    zlib = None  # type: ignore[assignment]
+
+try:
+    import bz2
+except ImportError:  # pragma: no cover
+    bz2 = None  # type: ignore[assignment]
+
+try:
+    import lzma
+except ImportError:  # pragma: no cover
+    lzma = None  # type: ignore[assignment]
+
+try:
+    from compression import zstd
+except ImportError:  # pragma: no cover
+    zstd = None
 
 from zipwire._constants import STREAM_CHUNK_SIZE, CompressionMethod
+from zipwire._crypto import ZipCrypto
 from zipwire._errors import (
+    BadZipFile,
     CRCMismatch,
     FileTooLarge,
     SizeMismatch,
     TruncatedStream,
     UnsupportedCompression,
 )
+from zipwire._write import awrite_all, write_all
 
 if typing.TYPE_CHECKING:
-    import lzma
     from collections.abc import Iterator
+    from lzma import LZMADecompressor
+
+# ZipCrypto runs in Python, so use smaller steps than the native codecs.
+_DECRYPT_CHUNK_SIZE = 16 * 1024
 
 
-class Decompressor(typing.Protocol):
+class _Decompressor(typing.Protocol):
     @property
     def eof(self) -> bool: ...
 
     def decompress(self, data: bytes, max_length: int, /) -> bytes: ...
 
 
-class DeflateDecompressor(Decompressor, typing.Protocol):
+class _DeflateDecompressor(_Decompressor, typing.Protocol):
     @property
     def unconsumed_tail(self) -> bytes: ...
 
 
-class IncrementalDecompressor(Decompressor, typing.Protocol):
+class _IncrementalDecompressor(_Decompressor, typing.Protocol):
     @property
     def needs_input(self) -> bool: ...
 
 
 class ZipLZMADecompressor:
-    """Incremental decoder for ZIP-LZMA (method 14) compressed data.
+    """Decode ZIP's properties header before feeding raw LZMA1 data."""
 
-    Buffers the ZIP-LZMA header from the first input bytes -- two
-    version bytes, a two-byte little-endian property size, then that
-    many bytes of LZMA1 properties -- and decodes the remaining raw
-    LZMA1 stream.  The version bytes are deliberately not validated:
-    the ZIP specification says 1.0 while stdlib :mod:`zipfile` writes
-    9.4, and the properties fully determine the decoder.
-
-    Implements the :class:`IncrementalDecompressor` protocol.
-    """
-
-    # Fixed part of the ZIP-LZMA payload header: 2 version bytes followed
-    # by a 2-byte little-endian size of the LZMA1 properties that follow.
-    _FIXED_HEADER_SIZE = 4
-
-    # The largest dictionary a real encoder writes into a ZIP is 64 MiB
-    # (xz and 7-Zip "ultra" mode, preset 9); stdlib zipfile writes
-    # 8 MiB.  A larger claim in the properties comes from a hostile or
-    # broken archive and is clamped, so a crafted entry cannot reserve
-    # absurd address space and commit charge.  Clamping cannot corrupt
-    # decoding: an LZMA match never references farther back than the
-    # output decoded so far, and a stream that does need more fails
-    # with a clean "Corrupt input data" error.
     _MAX_DICT_SIZE = 64 * 1024 * 1024
 
     def __init__(self) -> None:
-        try:
-            import lzma
-        except ImportError:  # pragma: no cover
-            raise UnsupportedCompression(CompressionMethod.LZMA) from None
+        self._header = bytearray()
+        self._decoder: LZMADecompressor | None = None
 
-        self._lzma = lzma
-        self._decoder: lzma.LZMADecompressor | None = None
-        self._pending = bytearray()
-        self.eof = False
+    @property
+    def eof(self) -> bool:
+        return self._decoder is not None and self._decoder.eof
 
     @property
     def needs_input(self) -> bool:
-        # While the header is still incomplete, more input is required;
-        # afterwards defer to the wrapped decoder so a bounded
-        # decompress() call can be drained across reads.
+        return self._decoder is None or self._decoder.needs_input
+
+    def decompress(self, data: bytes, max_length: int) -> bytes:
         if self._decoder is None:
-            return True
-        return self._decoder.needs_input
-
-    @property
-    def header_pending(self) -> bool:
-        """Whether the ZIP-LZMA header is still incomplete."""
-        return self._decoder is None
-
-    def _lzma1_filter(self, props: bytes) -> dict[str, int]:
-        """Translate ZIP-LZMA properties into a raw LZMA1 filter spec.
-
-        A ZIP-LZMA (method 14) payload is not an xz or ``.lzma``
-        container, which is why ``lzma.decompress()`` and a plain
-        ``lzma.LZMADecompressor()`` reject it.  After the header it
-        holds a raw LZMA1 stream, which needs a ``FORMAT_RAW`` decoder
-        configured from the properties.
-
-        Security: *props* comes from the remote archive and is
-        untrusted.  The lc/lp/pb encoding and the property length are
-        validated here and the dictionary size claim is clamped to
-        :attr:`_MAX_DICT_SIZE`; everything else is left to liblzma,
-        which rejects values it cannot use before any decoding happens.
-        The decoded output itself stays bounded by the CRC and size
-        verification.
-        """
-        lzma = self._lzma
-        if len(props) != 5:
-            raise lzma.LZMAError(f"invalid ZIP-LZMA properties size: {len(props)}")
-        encoded = props[0]
-        if encoded >= 9 * 5 * 5:  # lc < 9, lp < 5, pb < 5
-            raise lzma.LZMAError("invalid ZIP-LZMA lc/lp/pb properties")
-        pb, rest = divmod(encoded, 45)
-        lp, lc = divmod(rest, 9)
-        dict_size = min(int.from_bytes(props[1:5], "little"), self._MAX_DICT_SIZE)
-        return {
-            "id": lzma.FILTER_LZMA1,
-            "lc": lc,
-            "lp": lp,
-            "pb": pb,
-            "dict_size": dict_size,
-        }
-
-    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
-        if self._decoder is None:
-            self._pending += data
-            if len(self._pending) < self._FIXED_HEADER_SIZE:
+            # ZIP method 14 uses a 4-byte prefix and the 5-byte LZMA1
+            # properties block, not the .xz/.lzma container formats.
+            if len(self._header) < 4:
+                needed = 4 - len(self._header)
+                self._header.extend(data[:needed])
+                data = data[needed:]
+                if len(self._header) < 4:
+                    return b""
+            properties_size = int.from_bytes(self._header[2:4], "little")
+            needed = 4 + properties_size - len(self._header)
+            self._header.extend(data[:needed])
+            data = data[needed:]
+            # Like zipfile, validate only once the properties and at least
+            # one payload byte arrive. The 16-bit size bounds buffering.
+            if not data:
                 return b""
-            props_size = int.from_bytes(self._pending[2:4], "little")
-            if len(self._pending) < self._FIXED_HEADER_SIZE + props_size:
-                return b""
-            props = bytes(self._pending[4 : 4 + props_size])
-            self._decoder = self._lzma.LZMADecompressor(
-                self._lzma.FORMAT_RAW,
-                filters=[self._lzma1_filter(props)],
+            assert lzma is not None
+            if properties_size != 5:
+                raise lzma.LZMAError("Invalid or unsupported options")
+            properties = self._header[4]
+            if properties >= 225:
+                raise lzma.LZMAError("Invalid or unsupported options")
+            self._decoder = lzma.LZMADecompressor(
+                format=lzma.FORMAT_RAW,
+                filters=[
+                    {
+                        "id": lzma.FILTER_LZMA1,
+                        "lc": properties % 9,
+                        "lp": (properties // 9) % 5,
+                        "pb": properties // 45,
+                        "dict_size": min(
+                            self._MAX_DICT_SIZE,
+                            max(4096, int.from_bytes(self._header[5:9], "little")),
+                        ),
+                    }
+                ],
             )
-            data = bytes(self._pending[4 + props_size :])
-            self._pending.clear()
-        result = self._decoder.decompress(data, max_length)
-        self.eof = self._decoder.eof
-        return result
+        return self._decoder.decompress(data, max_length)
 
 
-def _decompress_zip_lzma(data: bytes) -> bytes:
-    """Decode a complete ZIP-LZMA payload in one shot."""
-    try:
-        import lzma
-    except ImportError:  # pragma: no cover
-        raise UnsupportedCompression(CompressionMethod.LZMA) from None
-
-    decoder = ZipLZMADecompressor()
-    result = decoder.decompress(data)
-    if decoder.header_pending:
-        raise lzma.LZMAError("ZIP-LZMA header is truncated")
-    if not decoder.eof:
-        raise lzma.LZMAError("compressed data ended before the end-of-stream marker")
-    return result
+def _stored_data(data: bytes, expected_size: int, compressed_size: int | None) -> bytes:
+    """Preserve the stored-entry fast path while checking input exhaustion."""
+    if compressed_size is None:
+        return data
+    else:
+        data = data[:compressed_size]
+        if len(data) < compressed_size and (not data or len(data) < expected_size):
+            raise TruncatedStream("Compressed ZIP entry is truncated")
+    return data[:expected_size]
 
 
 def decompress(
@@ -165,56 +142,37 @@ def decompress(
     method: int,
     expected_size: int,
     expected_crc: int,
+    *,
+    filename: str = "",
+    compressed_size: int | None = None,
+    pwd: bytes | None = None,
+    encryption_check: int | None = None,
 ) -> bytes:
-    """Decompress data and verify CRC-32.
-
-    Args:
-        data: The raw (possibly compressed) file data.
-        method: ZIP compression method (0=stored, 8=deflated, 12=bzip2, 14=lzma, 93=zstandard).
-        expected_size: Expected uncompressed size, verified against the
-            actual decompressed length.
-        expected_crc: Expected CRC-32 of the uncompressed data.
-
-    Returns:
-        The decompressed bytes.
-
-    Raises:
-        UnsupportedCompression: If the compression method is not supported.
-        CRCMismatch: If the CRC-32 check fails.
-        SizeMismatch: If the decompressed size differs from *expected_size*.
-    """
-    match method:
-        case CompressionMethod.STORED:
-            result = data
-        case CompressionMethod.DEFLATED:
-            # -15 = raw deflate (no zlib/gzip header)
-            result = zlib.decompress(data, -15)
-        case CompressionMethod.BZIP2:
-            try:
-                import bz2
-            except ImportError:  # pragma: no cover
-                raise UnsupportedCompression(method) from None
-
-            result = bz2.decompress(data)
-        case CompressionMethod.LZMA:
-            result = _decompress_zip_lzma(data)
-        case CompressionMethod.ZSTANDARD:
-            try:
-                from compression.zstd import decompress as _zstd_decompress
-            except ImportError:  # pragma: no cover
-                raise UnsupportedCompression(method) from None
-
-            result = _zstd_decompress(data)
-        case _:
-            raise UnsupportedCompression(method)
-
-    actual_crc = zlib.crc32(result) & 0xFFFFFFFF
-    if actual_crc != expected_crc:
-        raise CRCMismatch(expected_crc, actual_crc)
-    if len(result) != expected_size:
-        raise SizeMismatch(expected_size, len(result))
-
-    return result
+    """Decode a complete entry using the same checks as streamed extraction."""
+    if method == CompressionMethod.STORED and encryption_check is None:
+        data = _stored_data(data, expected_size, compressed_size)
+        actual_crc = crc32(data)
+        if actual_crc != expected_crc:
+            raise CRCMismatch(expected_crc, actual_crc)
+        if compressed_size is None and len(data) != expected_size:
+            raise SizeMismatch(expected_size, len(data))
+        return data
+    dest = io.BytesIO()
+    decoder = StreamingDecompressor(
+        method,
+        expected_crc,
+        filename=filename,
+        expected_size=expected_size,
+        compressed_size=compressed_size,
+        pwd=pwd,
+        encryption_check=encryption_check,
+    )
+    write_all(dest, decoder.feed_chunks(data))
+    if method == CompressionMethod.LZMA and compressed_size is None and not decoder.eof:
+        assert lzma is not None
+        raise lzma.LZMAError("ZIP-LZMA stream is truncated")
+    decoder.finish()
+    return dest.getvalue()
 
 
 async def adecompress(
@@ -222,57 +180,52 @@ async def adecompress(
     method: int,
     expected_size: int,
     expected_crc: int,
+    *,
+    filename: str = "",
+    compressed_size: int | None = None,
+    pwd: bytes | None = None,
+    encryption_check: int | None = None,
 ) -> bytes:
-    """Decompress data with scheduling checkpoints between bounded steps.
-
-    Same result as :func:`decompress` -- including the CRC-32 and size
-    checks and the exceptions they raise -- but the work is split into
-    chunks of at most 2 MiB of decompressed output and the event loop
-    runs between them.
-    """
-    if method == CompressionMethod.STORED:
+    """Decode an entry with scheduling checkpoints between bounded steps."""
+    if method == CompressionMethod.STORED and encryption_check is None:
+        data = _stored_data(data, expected_size, compressed_size)
         actual_crc = 0
         with memoryview(data) as view:
             for offset in range(0, len(data), STREAM_CHUNK_SIZE):
-                actual_crc = zlib.crc32(view[offset : offset + STREAM_CHUNK_SIZE], actual_crc)
-                await asyncio.sleep(0)  # yield to loop
+                actual_crc = crc32(view[offset : offset + STREAM_CHUNK_SIZE], actual_crc)
+                await checkpoint()
         if actual_crc != expected_crc:
             raise CRCMismatch(expected_crc, actual_crc)
-        if len(data) != expected_size:
+        if compressed_size is None and len(data) != expected_size:
             raise SizeMismatch(expected_size, len(data))
         return data
-
-    output = io.BytesIO()
-    sd = StreamingDecompressor(method, expected_crc, expected_size=expected_size)
-    for chunk in sd.feed_chunks(data):
-        output.write(chunk)
-        await asyncio.sleep(0)  # yield to loop
-    sd.finish()
-    return output.getvalue()
+    dest = io.BytesIO()
+    decoder = StreamingDecompressor(
+        method,
+        expected_crc,
+        filename=filename,
+        expected_size=expected_size,
+        compressed_size=compressed_size,
+        pwd=pwd,
+        encryption_check=encryption_check,
+    )
+    await awrite_all(dest, decoder.feed_chunks(data), checkpoint=checkpoint)
+    decoder.finish()
+    return dest.getvalue()
 
 
 class StreamingDecompressor:
-    """Incrementally decompress data and return the output to the caller.
+    """Return decoded output without owning a destination.
 
-    :meth:`feed_chunks` yields decoded output in bounded chunks, never
-    larger than 2 MiB, so a single giant entry cannot inflate into one
-    enormous allocation.  It also yields empty chunks for decoding steps
-    that produced no output; async callers can turn those steps into
-    scheduling checkpoints.  :meth:`feed` collects a feed's output into
-    bytes for callers that do not need bounded output buffering.  Call
-    :meth:`finish` after the last input chunk; it verifies that a
-    compressed stream reached its end and checks CRC-32 and, when given,
-    the expected output size.
+    ``feed_chunks()`` yields bounded chunks, including empty chunks that
+    mark decoding steps with no output. Async callers can use these steps
+    as scheduling checkpoints. ``feed()`` collects a feed's output into
+    bytes for callers that do not need bounded output buffering.
+    ``finish()`` checks input exhaustion and verifies CRC-32.
 
-    Feeding non-empty data after the stream has ended raises
-    :exc:`~zipwire.TruncatedStream`.
-
-    When *max_output_size* is set, the cumulative decompressed output is
-    tracked and :exc:`~zipwire.FileTooLarge` is raised if it exceeds the
-    limit.  When *expected_size* is set, output beyond it is rejected as
-    soon as it is produced, and :meth:`finish` rejects a total output
-    that falls short of it, both with :exc:`~zipwire.SizeMismatch`.
-    *max_output_size* takes precedence when a chunk exceeds both.
+    Without ``compressed_size``, the decoded size and codec end marker
+    are checked strictly. Archive readers pass the compressed extent to
+    follow zipfile's output truncation and input-exhaustion rules instead.
     """
 
     def __init__(
@@ -283,85 +236,113 @@ class StreamingDecompressor:
         filename: str = "",
         max_output_size: int | None = None,
         expected_size: int | None = None,
+        compressed_size: int | None = None,
+        pwd: bytes | None = None,
+        encryption_check: int | None = None,
     ) -> None:
         self._expected_crc = expected_crc
-        self._expected_size = expected_size
-        self._crc: int = 0
-        self._output_size: int = 0
+        self._crc = 0
+        self._output_size = 0
         self._filename = filename
         self._max_output_size = max_output_size
+        self._expected_size = expected_size
+        self._output_complete = False
+        self._compressed_left = compressed_size
+        self._strict_size = compressed_size is None
         self.eof = False
-        self._stream_ended = False
-        self._deflate: DeflateDecompressor | None = None
-        self._incremental: IncrementalDecompressor | None = None
+        self._decrypter = (
+            ZipCrypto(pwd) if pwd is not None and encryption_check is not None else None
+        )
+        self._encryption_check = encryption_check
+        self._encryption_header = bytearray()
+        self._deflate: _DeflateDecompressor | None = None
+        self._incremental: _IncrementalDecompressor | None = None
 
         match method:
             case CompressionMethod.STORED:
                 pass
             case CompressionMethod.DEFLATED:
+                if zlib is None:
+                    raise RuntimeError("Compression requires the (missing) zlib module")
                 self._deflate = zlib.decompressobj(-15)
             case CompressionMethod.BZIP2:
-                try:
-                    import bz2
-                except ImportError:  # pragma: no cover
-                    raise UnsupportedCompression(method) from None
-
+                if bz2 is None:
+                    raise RuntimeError("Compression requires the (missing) bz2 module")
                 self._incremental = bz2.BZ2Decompressor()
             case CompressionMethod.LZMA:
+                if lzma is None:
+                    raise RuntimeError("Compression requires the (missing) lzma module")
                 self._incremental = ZipLZMADecompressor()
-            case CompressionMethod.ZSTANDARD:
-                try:
-                    from compression.zstd import ZstdDecompressor
-                except ImportError:  # pragma: no cover
-                    raise UnsupportedCompression(method) from None
-
-                self._incremental = ZstdDecompressor()
+            case CompressionMethod.ZSTANDARD | CompressionMethod.ZSTANDARD_LEGACY:
+                if zstd is None:
+                    raise RuntimeError(
+                        "Compression requires the (missing) compression.zstd module"
+                    )
+                self._incremental = zstd.ZstdDecompressor()
             case _:
                 raise UnsupportedCompression(method)
 
-        self._stored = self._deflate is None and self._incremental is None
-
     def _check_output(self, chunk: bytes) -> bytes:
-        """Account for decompressed bytes and enforce the size limits."""
+        if self._expected_size is not None and not self._strict_size:
+            remaining = self._expected_size - self._output_size
+            chunk = chunk[:remaining]
+            if len(chunk) == remaining:
+                self._output_complete = True
         if not chunk:
             return b""
         self._output_size += len(chunk)
         if self._max_output_size is not None and self._output_size > self._max_output_size:
             raise FileTooLarge(self._filename, self._output_size, self._max_output_size)
-        if self._expected_size is not None and self._output_size > self._expected_size:
+        if (
+            self._strict_size
+            and self._expected_size is not None
+            and self._output_size > self._expected_size
+        ):
             raise SizeMismatch(self._expected_size, self._output_size)
-        self._crc = zlib.crc32(chunk, self._crc)
+        self._crc = crc32(chunk, self._crc)
         return chunk
 
-    def _check_open(self, data: bytes) -> None:
-        """Reject non-empty input once the stream has ended."""
-        if self.eof and data:
-            raise TruncatedStream(
-                f"{self._filename!r}: {len(data)} bytes after end of compressed stream"
-            )
-
     def feed(self, data: bytes) -> bytes:
-        """Decompress *data* and return the output after checking its size."""
-        if self._stored:
-            # The input is already the decoded output; return it without
-            # the slice-and-join round trip that feed_chunks() would do.
-            self._check_open(data)
-            return self._check_output(data)
+        """Consume compressed input and return its decoded output as bytes."""
+        if self._deflate is None and self._incremental is None and self._decrypter is None:
+            if self.eof:
+                if data:
+                    raise TruncatedStream("Data after end of compressed stream")
+                return b""
+            if self._compressed_left is not None:
+                data = data[: self._compressed_left]
+                self._compressed_left -= len(data)
+            output = self._check_output(data)
+            self.eof = self._output_complete
+            return output
         return b"".join(self.feed_chunks(data))
 
     def feed_chunks(self, data: bytes) -> Iterator[bytes]:
-        """Decompress *data* and yield bounded output chunks.
-
-        Empty chunks mark decoding steps that produced no output; they
-        are still useful as scheduling checkpoints.  Raises
-        :exc:`~zipwire.TruncatedStream` when *data* is non-empty and the
-        stream has already ended.
-        """
+        """Yield bounded output, including steps with no output bytes."""
         if self.eof:
-            self._check_open(data)
+            if data:
+                raise TruncatedStream("Data after end of compressed stream")
             return
-        for offset in range(0, len(data), STREAM_CHUNK_SIZE):
-            chunk = data[offset : offset + STREAM_CHUNK_SIZE]
+        if self._compressed_left is not None:
+            data = data[: self._compressed_left]
+            self._compressed_left -= len(data)
+        start = 0
+        if self._decrypter is not None:
+            if len(self._encryption_header) < 12:
+                needed = 12 - len(self._encryption_header)
+                self._encryption_header.extend(self._decrypter.decrypt(data[:needed]))
+                start = needed
+                if len(self._encryption_header) < 12:
+                    return
+                if self._encryption_header[-1] != self._encryption_check:
+                    raise RuntimeError(f"Bad password for file {self._filename!r}")
+            chunk_size = _DECRYPT_CHUNK_SIZE
+        else:
+            chunk_size = STREAM_CHUNK_SIZE
+        for offset in range(start, len(data), chunk_size):
+            chunk = data[offset : offset + chunk_size]
+            if self._decrypter is not None:
+                chunk = self._decrypter.decrypt(chunk)
             yield from self._decode_chunks(chunk)
             if self.eof:
                 break
@@ -370,13 +351,16 @@ class StreamingDecompressor:
         decoder = self._deflate if self._deflate is not None else self._incremental
         if decoder is None:
             yield self._check_output(data)
+            self.eof = self._output_complete
             return
+        # Reaching the output limit must not skip codec errors in the rest
+        # of the compressed member. Drain in bounded chunks, discarding any
+        # excess output in _check_output while retaining async checkpoints.
         while True:
             chunk = decoder.decompress(data, STREAM_CHUNK_SIZE)
             yield self._check_output(chunk)
             self.eof = decoder.eof
             if self.eof:
-                self._stream_ended = True
                 break
             if self._deflate is not None:
                 data = self._deflate.unconsumed_tail
@@ -389,20 +373,31 @@ class StreamingDecompressor:
                 data = b""
 
     def finish(self) -> None:
-        """Verify that the stream ended cleanly, then check size and CRC-32.
+        """Verify CRC-32 even if the codec ended before the declared size.
 
-        Raises :exc:`~zipwire.TruncatedStream` when a compressed stream
-        never reached its end, :exc:`~zipwire.CRCMismatch` when the
-        CRC-32 does not match, and :exc:`~zipwire.SizeMismatch` when
-        *expected_size* was given and the total output falls short of it
-        (output beyond *expected_size* is already rejected while
-        feeding).
+        Like zipfile, compressed input exhaustion need not coincide with
+        a codec end marker. However, input ending before the declared
+        compressed size is an error unless the codec ended or the declared
+        output size was already reached while decoding the received input.
+        Only the bytes returned to the caller count toward the CRC.
         """
+        if (
+            self._strict_size
+            and (self._deflate is not None or self._incremental is not None)
+            and not self.eof
+        ):
+            raise TruncatedStream("Compressed ZIP entry is truncated")
+        if self._compressed_left and not (self.eof or self._output_complete):
+            raise TruncatedStream("Compressed ZIP entry is truncated")
+        if self._decrypter is not None and len(self._encryption_header) != 12:
+            raise BadZipFile("Truncated ZIP encryption header")
         self.eof = True
-        if not self._stored and not self._stream_ended:
-            raise TruncatedStream(f"{self._filename!r}: compressed stream is truncated")
         actual_crc = self._crc & 0xFFFFFFFF
         if actual_crc != self._expected_crc:
             raise CRCMismatch(self._expected_crc, actual_crc)
-        if self._expected_size is not None and self._output_size != self._expected_size:
+        if (
+            self._strict_size
+            and self._expected_size is not None
+            and self._output_size != self._expected_size
+        ):
             raise SizeMismatch(self._expected_size, self._output_size)

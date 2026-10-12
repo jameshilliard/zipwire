@@ -20,7 +20,7 @@ class TestRemoteZipInfoCompat:
     def _get_infos(self, zip_data: bytes) -> list[RemoteZipInfo]:
         eocd = find_eocd(zip_data, len(zip_data))
         cd_data = zip_data[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = list(parse_central_directory(cd_data))
         return [RemoteZipInfo._from_central_dir_entry(e) for e in entries]
 
     def test_isinstance(self, stored_zip: bytes) -> None:

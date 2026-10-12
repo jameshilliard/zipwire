@@ -150,6 +150,7 @@ class MockSyncReader:
         offset: int,
         length: int,
     ) -> tuple[bytes, MockHeaders]:
+        assert 0 <= offset <= offset + length <= len(self.data)
         self.read_count += 1
         self.requests.append((offset, length))
         total = len(self.data)
@@ -159,6 +160,7 @@ class MockSyncReader:
         return chunk, headers
 
     def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
+        assert 0 <= offset <= offset + length <= len(self.data)
         data = self.data[offset : offset + length]
         chunk_size = 1024
         for pos in range(0, len(data), chunk_size):
@@ -196,6 +198,7 @@ class MockAsyncReader:
         offset: int,
         length: int,
     ) -> tuple[bytes, MockHeaders]:
+        assert 0 <= offset <= offset + length <= len(self.data)
         self.read_count += 1
         self.requests.append((offset, length))
         total = len(self.data)
@@ -205,6 +208,7 @@ class MockAsyncReader:
         return chunk, headers
 
     async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
+        assert 0 <= offset <= offset + length <= len(self.data)
         data = self.data[offset : offset + length]
         chunk_size = 1024
         for pos in range(0, len(data), chunk_size):

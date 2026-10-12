@@ -27,13 +27,15 @@ import typing
 from urllib.parse import unquote, urlparse
 
 from zipwire._async import AsyncRemoteZip
-from zipwire._constants import PREFETCH_EXTRA
+from zipwire._base import RemoteZipBase
 from zipwire._sync import SyncRemoteZip
-from zipwire._zipinfo import RemoteZipInfo
 from zipwire._zipstructs import LocalFileHeaderRecord
 
 if typing.TYPE_CHECKING:
+    import zipfile
+
     from zipwire._types import AsyncReader, SyncReader
+    from zipwire._zipinfo import RemoteZipInfo
 
 # Minimum tail fetch size.  The actual tail is max(_MIN_TAIL_SIZE,
 # file_size // 256), scaling to ~0.4% of the archive for large wheels.
@@ -66,7 +68,7 @@ def _dist_info_from_url(url: str) -> str:
     return f"{parts[0]}-{parts[1]}.dist-info/"
 
 
-class _RemoteWheelMixin:
+class _RemoteWheelMixin(RemoteZipBase):
     """Shared state and accessors for wheel subclasses."""
 
     _dist_info_dir: str
@@ -106,53 +108,33 @@ class _RemoteWheelMixin:
         return max(_MIN_TAIL_SIZE, file_size // 256)
 
     def _store_tail(self, tail_start: int, tail: bytes) -> None:
-        # Retain the tail so dist-info entries inside it are served
-        # from the buffer without extra HTTP requests.
         self._tail_start = tail_start
         self._tail_data = tail
 
     def _clear(self) -> None:
-        super()._clear()  # type: ignore[misc]
+        super()._clear()
         self._tail_start = 0
         self._tail_data = b""
 
     def _resolve_from_tail(
         self,
-        info: RemoteZipInfo,
-    ) -> tuple[RemoteZipInfo, int, bytes] | None:
+        info: zipfile.ZipInfo,
+    ) -> tuple[zipfile.ZipInfo, int, bytes] | None:
         """Try to resolve an entry's compressed data from the tail buffer.
-
-        The local file header's filename is validated against the
-        central directory name, as ``zipfile.ZipFile.open()`` does.
 
         Returns ``(info, data_offset, compressed)`` if the entry fits
         entirely within the tail, otherwise ``None``.
         """
         tail_start = self._tail_start
         tail_end = tail_start + len(self._tail_data)
-        end = (
-            info.header_offset
-            + LocalFileHeaderRecord.FIXED_SIZE
-            + PREFETCH_EXTRA
-            + info.compress_size
-        )
-        if info.header_offset < tail_start or end > tail_end:
+        if info.header_offset < tail_start:
             return None
         rel = info.header_offset - tail_start
-        local_header = LocalFileHeaderRecord.parse(self._tail_data[rel:])
-        data_start = rel + LocalFileHeaderRecord.FIXED_SIZE + local_header.data_offset_past_header
-        if data_start + info.compress_size > len(self._tail_data):
-            # Rare: the local header's variable fields exceeded the
-            # PREFETCH_EXTRA allowance, so the compressed data is not
-            # fully covered by the tail.  Use the regular resolve path.
+        header = LocalFileHeaderRecord.parse(self._tail_data, offset=rel)
+        data_offset = self._validate_local_header(info, header)
+        if data_offset + info.compress_size > tail_end:
             return None
-        data_offset = (
-            info.header_offset
-            + LocalFileHeaderRecord.FIXED_SIZE
-            + local_header.data_offset_past_header
-        )
-        self._validate_data_region(info, data_offset)  # type: ignore[attr-defined]
-        self._check_local_filename(info, local_header.filename)  # type: ignore[attr-defined]
+        data_start = data_offset - tail_start
         compressed = self._tail_data[data_start : data_start + info.compress_size]
         return info, data_offset, compressed
 
@@ -162,11 +144,7 @@ class _RemoteWheelMixin:
         Returns only files, not directory entries.
         """
         prefix = self._dist_info_dir
-        return [
-            e
-            for e in self.infolist()  # type: ignore[attr-defined]
-            if e.filename.startswith(prefix) and not e.is_dir()
-        ]
+        return [e for e in self.infolist() if e.filename.startswith(prefix) and not e.is_dir()]
 
 
 class SyncRemoteWheel(_RemoteWheelMixin, SyncRemoteZip):
@@ -175,9 +153,6 @@ class SyncRemoteWheel(_RemoteWheelMixin, SyncRemoteZip):
     Parses the wheel URL to derive the ``.dist-info`` directory name
     and fetches a larger tail so that dist-info entries at the end of
     the archive are served from the buffer without extra HTTP requests.
-
-    Entry names are always decoded as UTF-8, as PEP 427 requires;
-    there is no ``metadata_encoding`` argument.
 
     Must be used as a context manager.  Not thread-safe.
 
@@ -196,12 +171,8 @@ class SyncRemoteWheel(_RemoteWheelMixin, SyncRemoteZip):
 
     def _resolve_entry(
         self,
-        name: str | RemoteZipInfo,
-    ) -> tuple[RemoteZipInfo, int, bytes | None] | None:
-        info = name if isinstance(name, RemoteZipInfo) else self.getinfo(name)
-        if info.is_dir():
-            return None
-        self._validate_entry(info)
+        info: zipfile.ZipInfo,
+    ) -> tuple[zipfile.ZipInfo, int, bytes | None]:
         result = self._resolve_from_tail(info)
         if result is not None:
             return result
@@ -214,9 +185,6 @@ class AsyncRemoteWheel(_RemoteWheelMixin, AsyncRemoteZip):
     Parses the wheel URL to derive the ``.dist-info`` directory name
     and fetches a larger tail so that dist-info entries at the end of
     the archive are served from the buffer without extra HTTP requests.
-
-    Entry names are always decoded as UTF-8, as PEP 427 requires;
-    there is no ``metadata_encoding`` argument.
 
     Must be used as an async context manager.  Not thread-safe.
 
@@ -235,12 +203,8 @@ class AsyncRemoteWheel(_RemoteWheelMixin, AsyncRemoteZip):
 
     async def _resolve_entry(
         self,
-        name: str | RemoteZipInfo,
-    ) -> tuple[RemoteZipInfo, int, bytes | None] | None:
-        info = name if isinstance(name, RemoteZipInfo) else self.getinfo(name)
-        if info.is_dir():
-            return None
-        self._validate_entry(info)
+        info: zipfile.ZipInfo,
+    ) -> tuple[zipfile.ZipInfo, int, bytes | None]:
         result = self._resolve_from_tail(info)
         if result is not None:
             return result

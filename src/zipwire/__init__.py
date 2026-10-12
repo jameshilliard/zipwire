@@ -4,6 +4,57 @@ Only the central directory and the requested entries are downloaded,
 so large archives can be inspected and partially extracted without
 fetching the entire file.
 
+Archive compatibility
+---------------------
+
+Compatibility covers supported ZIP metadata and member contents through
+a read-only remote archive API. The complete ``zipfile.ZipFile`` interface
+is not implemented. Member-range bounds are enforced even where a stdlib
+version tolerates an invalid extent; exact exceptions for every malformed
+archive are not guaranteed to match across Python versions.
+
+Both APIs read stored, Deflate, Bzip2, and ZIP-LZMA entries. Zstandard
+methods 20 and 93 are supported when ``compression.zstd`` is available.
+ZIP64, prepended executable data, Unicode Path extra fields, and
+traditional ZipCrypto encryption are supported. Pass ``metadata_encoding``
+to a generic ZIP constructor for legacy filenames, and ``pwd`` to ``read``
+or ``read_into`` for encrypted entries. ``setpassword()`` sets a default
+password, and ``comment`` exposes the archive comment as bytes.
+
+The wheel subclasses also support passwords and archive comments; they
+always decode filenames as UTF-8 and have no ``metadata_encoding`` argument.
+AES encryption,
+multi-volume archives, Deflate64, and PPMd remain unsupported.
+End-record selection and tolerance of incomplete compressed streams follow
+stdlib ``zipfile``. Malformed records, incomplete comments, and null bytes
+in filenames remain rejected. Returned data is limited to the declared
+uncompressed size and verified against the entry's CRC. Missing optional
+compression modules raise ``RuntimeError`` only when that codec is needed.
+Compressed members continue decoding beyond the output limit to detect
+codec errors, discarding excess output in bounded chunks.
+Invalid LZMA properties raise ``lzma.LZMAError``, as in stdlib ``zipfile``.
+Premature input exhaustion raises ``TruncatedStream`` (also an ``EOFError``
+and ``BadZipFile``) if decoding still needs compressed data.
+Archives shorter than the minimum end record are rejected
+before any range request.
+
+Archive loading reuses central-directory bytes already present in the
+initial tail. Wheel readers also reuse complete cached members. Size
+limits are checked before issuing member-specific range requests.
+Local header signatures are checked before unsupported entry flags;
+filenames and compressed extents are validated before passwords.
+Decoded chunks are at most 2 MiB. Total memory also depends on backend
+and destination buffering, codec dictionaries, archive metadata, and
+the adaptive wheel tail cache. ``max_file_size`` limits returned output,
+not total memory or the work spent decoding excess data.
+Async reads use AnyIO to yield between bounded decoding steps on asyncio
+and Trio, including when all input is already buffered.
+``read_into`` retries partial destination writes and yields between retries
+in async readers. Writers return a positive byte count or ``None`` when
+the whole chunk was consumed; invalid counts raise ``OSError``. Async
+writers resolve their awaitable to the same count or ``None``. Each write
+is awaited before producing more output, providing backpressure.
+
 Synchronous example
 -------------------
 
@@ -17,6 +68,9 @@ Synchronous example
         for info in rz.infolist():
             print(f"{info.filename}  {info.file_size} bytes")
         data = rz.read("path/inside/archive.txt")
+
+        # Traditional ZIP passwords are bytes, as in stdlib zipfile.
+        # data = rz.read("encrypted.txt", pwd=b"password")
 
         # Stream a large entry directly to disk
         with open("local.bin", "wb") as fh:
@@ -71,6 +125,9 @@ Local files:
     filesystem through the same API (no extra dependency).  Useful for
     testing or for handling ``file://`` URIs and local paths uniformly
     with HTTP URLs.
+
+``AsyncFileReader`` waits for an active worker operation to finish before
+propagating cancellation, so context-manager cleanup can safely close it.
 
 ::
 

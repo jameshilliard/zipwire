@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]
-dependencies = ["urllib3>=2"]
+dependencies = ["anyio>=4", "urllib3>=2"]
 
 [project.urls]
 Homepage = "https://github.com/tiran/zipwire"
@@ -41,6 +41,7 @@ all = ["httpx2[http2]>=2", "aiohttp>=3.9", "requests>=2.28"]
 dev = [
     "zipwire[all]",
     "anyio>=4",
+    "trio>=0.25",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "pytest-httpserver>=1",

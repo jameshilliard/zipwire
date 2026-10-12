@@ -49,6 +49,24 @@ class TestFindEocd:
         with pytest.raises(BadZipFile, match="truncated"):
             find_eocd(data, len(data))
 
+    @pytest.mark.parametrize("field", [5, 6])
+    def test_signature_in_eocd_field(self, field: int) -> None:
+        signature_value = int.from_bytes(b"PK\x05\x06", "little")
+        cd_size = signature_value if field == 5 else 50
+        cd_offset = signature_value if field == 6 else 100
+        record = EOCD_STRUCT.pack(b"PK\x05\x06", 0, 0, 1, 1, cd_size, cd_offset, 0)
+        tail = b"\0" * 20 + record
+        file_size = cd_offset + cd_size + len(record)
+        info = find_eocd(tail, file_size)
+        assert info.cd_size == cd_size
+        assert info.cd_offset == cd_offset
+        assert info.archive_offset == 0
+        assert info.comment == b""
+
+    def test_truncated_comment(self) -> None:
+        data = EOCD_STRUCT.pack(b"PK\x05\x06", 0, 0, 0, 0, 0, 0, 10) + b"short"
+        assert find_eocd(data, len(data)).comment == b"short"
+
     def test_zip64_eocd(self) -> None:
         """Construct a tail with ZIP64 EOCD Record + Locator + EOCD."""
         cd_entry_count = 5
@@ -71,7 +89,7 @@ class TestFindEocd:
 
         # The ZIP64 EOCD record is at the beginning of our tail
         # Its absolute offset in the file = tail_start + 0
-        file_size = 5000
+        file_size = cd_offset + cd_size + len(zip64_eocd) + 20 + 22
         tail_start = file_size - (len(zip64_eocd) + 20 + 22)  # zip64_eocd + locator + eocd
         zip64_eocd_abs_offset = tail_start
 
@@ -116,7 +134,7 @@ class TestFindEocd:
             0,
         )
         # tail is exactly the EOCD - no room for locator before it
-        with pytest.raises(BadZipFile, match="locator not found"):
+        with pytest.raises(BadZipFile, match="central directory offset"):
             find_eocd(eocd, len(eocd))
 
     def test_zip64_locator_bad_signature(self) -> None:
@@ -133,7 +151,7 @@ class TestFindEocd:
         )
         # 20 bytes of zeros before EOCD (wrong locator signature)
         tail = b"\x00" * 20 + eocd
-        with pytest.raises(BadZipFile, match="locator signature"):
+        with pytest.raises(BadZipFile, match="central directory offset"):
             find_eocd(tail, len(tail))
 
     def test_zip64_eocd_outside_tail(self) -> None:
@@ -191,7 +209,7 @@ class TestParseCentralDirectory:
     def test_stored_zip(self, stored_zip: bytes) -> None:
         eocd = find_eocd(stored_zip, len(stored_zip))
         cd_data = stored_zip[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = list(parse_central_directory(cd_data))
         assert len(entries) == 2
         filenames = [e.filename for e in entries]
         assert b"hello.txt" in filenames
@@ -200,7 +218,7 @@ class TestParseCentralDirectory:
     def test_entry_fields(self, stored_zip: bytes) -> None:
         eocd = find_eocd(stored_zip, len(stored_zip))
         cd_data = stored_zip[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = parse_central_directory(cd_data)
 
         hello_entry = next(e for e in entries if e.filename == b"hello.txt")
         assert hello_entry.compression_method == 0  # STORED
@@ -212,12 +230,12 @@ class TestParseCentralDirectory:
         # Central dir signature but truncated
         data = b"PK\x01\x02" + b"\x00" * 10
         with pytest.raises(BadZipFile, match="truncated"):
-            parse_central_directory(data, 1)
+            list(parse_central_directory(data))
 
     def test_bad_signature(self) -> None:
         data = b"\x00" * CENTRAL_DIR_SIZE
         with pytest.raises(BadZipFile, match="signature"):
-            parse_central_directory(data, 1)
+            list(parse_central_directory(data))
 
     def test_entry_past_end_of_data(self) -> None:
         """CD entry with filename_length=100 but only CENTRAL_DIR_SIZE bytes of data."""
@@ -242,8 +260,9 @@ class TestParseCentralDirectory:
             0,  # external_attr
             0,  # header_offset
         )
-        with pytest.raises(BadZipFile, match="past end"):
-            parse_central_directory(header, 1)
+        entries = list(parse_central_directory(header))
+        assert len(entries) == 1
+        assert entries[0].filename == b""
 
 
 class TestParseLocalFileHeader:

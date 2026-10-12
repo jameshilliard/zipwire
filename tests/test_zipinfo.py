@@ -8,14 +8,14 @@ import zipfile
 
 from zipwire._constants import ZIP64_EXTRA_FIELD_ID
 from zipwire._parser import find_eocd, parse_central_directory
-from zipwire._zipinfo import RemoteZipInfo, _apply_zip64_extra
+from zipwire._zipinfo import RemoteZipInfo, _apply_extra_fields
 
 
 class TestRemoteZipInfoCompat:
     def _get_infos(self, zip_data: bytes) -> list[RemoteZipInfo]:
         eocd = find_eocd(zip_data, len(zip_data))
         cd_data = zip_data[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = parse_central_directory(cd_data)
         return [RemoteZipInfo._from_central_dir_entry(e) for e in entries]
 
     def test_isinstance(self, stored_zip: bytes) -> None:
@@ -116,13 +116,13 @@ class TestZip64ExtraField:
         extra_data = struct.pack("<Q", real_file_size) + struct.pack("<Q", real_compress_size)
         info.extra = struct.pack("<HH", ZIP64_EXTRA_FIELD_ID, len(extra_data)) + extra_data
 
-        _apply_zip64_extra(info)
+        _apply_extra_fields(info, b"test.txt")
         assert info.file_size == real_file_size
         assert info.compress_size == real_compress_size
         assert info.header_offset == 100  # unchanged
 
     def test_zip64_extra_all_fields(self) -> None:
-        """All four sentinel fields are updated from ZIP64 extra field."""
+        """Sizes and offset are updated; the ZIP64 disk number is ignored."""
         info = RemoteZipInfo("test.txt")
         info.file_size = 0xFFFFFFFF
         info.compress_size = 0xFFFFFFFF
@@ -141,11 +141,11 @@ class TestZip64ExtraField:
         )
         info.extra = struct.pack("<HH", ZIP64_EXTRA_FIELD_ID, len(extra_data)) + extra_data
 
-        _apply_zip64_extra(info)
+        _apply_extra_fields(info, b"test.txt")
         assert info.file_size == real_file_size
         assert info.compress_size == real_compress_size
         assert info.header_offset == real_header_offset
-        assert info.volume == real_volume
+        assert info.volume == 0xFFFF
 
     def test_zip64_extra_with_other_fields(self) -> None:
         """Non-ZIP64 extra field preceding the ZIP64 field."""
@@ -165,6 +165,6 @@ class TestZip64ExtraField:
 
         info.extra = other_extra + zip64_extra
 
-        _apply_zip64_extra(info)
+        _apply_extra_fields(info, b"test.txt")
         assert info.file_size == real_file_size
         assert info.compress_size == 500  # unchanged (not sentinel)

@@ -6,6 +6,7 @@ the sync and async code paths.
 
 from __future__ import annotations
 
+import typing
 from dataclasses import dataclass
 
 from zipwire._constants import (
@@ -27,6 +28,9 @@ from zipwire._constants import (
 )
 from zipwire._errors import BadZipFile
 
+if typing.TYPE_CHECKING:
+    from collections.abc import Iterator, Mapping
+
 
 @dataclass(frozen=True, slots=True)
 class EOCDInfo:
@@ -35,6 +39,8 @@ class EOCDInfo:
     cd_offset: int
     cd_size: int
     cd_entry_count: int
+    archive_offset: int = 0
+    comment: bytes = b""
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +71,7 @@ class LocalHeaderInfo:
 
     filename_length: int
     extra_length: int
+    flags: int = 0
 
     @property
     def data_offset_past_header(self) -> int:
@@ -72,116 +79,124 @@ class LocalHeaderInfo:
         return self.filename_length + self.extra_length
 
 
-def find_eocd(tail: bytes, file_size: int) -> EOCDInfo:
-    """Find and parse the End of Central Directory record.
+class _ReadRequired(BadZipFile):
+    """A bounded range needed to finish parsing the end records."""
 
-    Args:
-        tail: The tail of the file (up to 65557 bytes).
-        file_size: Total size of the ZIP file.
+    def __init__(self, offset: int, length: int, message: str) -> None:
+        super().__init__(message)
+        self.offset = offset
+        self.length = length
 
-    Returns:
-        EOCDInfo with central directory location.
 
-    Raises:
-        BadZipFile: If no valid EOCD record is found.
-    """
-    # Search backwards for EOCD signature
-    pos = tail.rfind(EOCD_SIGNATURE)
-    if pos == -1:
+def _end_record(
+    tail: bytes,
+    file_size: int,
+    records: Mapping[int, bytes],
+    offset: int,
+    length: int,
+) -> bytes:
+    if offset < 0 or offset + length > file_size:
+        raise BadZipFile("ZIP64 end record is outside the archive")
+    tail_start = file_size - len(tail)
+    if offset >= tail_start:
+        return tail[offset - tail_start : offset - tail_start + length]
+    if offset not in records:
+        raise _ReadRequired(offset, length, "ZIP64 EOCD record is outside the fetched tail data")
+    data = records[offset]
+    if len(data) != length:
+        raise BadZipFile("ZIP64 end record is truncated")
+    return data
+
+
+def _find_eocd_offset(tail: bytes) -> int:
+    """Use zipfile's no-comment fast path and bounded signature search."""
+    if (
+        len(tail) >= EOCD_SIZE
+        and tail[-EOCD_SIZE : -EOCD_SIZE + 4] == EOCD_SIGNATURE
+        and tail[-2:] == b"\0\0"
+    ):
+        return len(tail) - EOCD_SIZE
+    pos = tail.rfind(EOCD_SIGNATURE, max(0, len(tail) - EOCD_SIZE - 0xFFFF))
+    if pos < 0:
         raise BadZipFile("Could not find End of Central Directory record")
-
     if len(tail) - pos < EOCD_SIZE:
         raise BadZipFile("EOCD record is truncated")
-
-    fields = EOCD_STRUCT.unpack_from(tail, pos)
-    # fields: signature, disk_num, disk_cd_start, cd_entries_this_disk,
-    #         cd_entries_total, cd_size, cd_offset, comment_length
-    cd_entry_count = fields[4]
-    cd_size = fields[5]
-    cd_offset = fields[6]
-
-    # Check for ZIP64 - indicated by 0xFFFF or 0xFFFFFFFF sentinel values
-    is_zip64 = cd_entry_count == 0xFFFF or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF
-
-    if is_zip64:
-        return _parse_zip64_eocd(tail, pos, file_size)
-
-    return EOCDInfo(
-        cd_offset=cd_offset,
-        cd_size=cd_size,
-        cd_entry_count=cd_entry_count,
-    )
+    return pos
 
 
-def _parse_zip64_eocd(tail: bytes, eocd_pos: int, file_size: int) -> EOCDInfo:
-    """Parse ZIP64 EOCD locator and record.
+def find_eocd(
+    tail: bytes, file_size: int, *, records: Mapping[int, bytes] | None = None
+) -> EOCDInfo:
+    """Parse end records, requesting any missing ZIP64 header with _ReadRequired.
 
-    Args:
-        tail: The tail bytes of the file.
-        eocd_pos: Position of the regular EOCD in `tail`.
-        file_size: Total file size.
-
-    Returns:
-        EOCDInfo with 64-bit values.
-
-    Raises:
-        BadZipFile: If ZIP64 structures are missing or invalid.
+    The returned directory and entry offsets include any prepended data.
+    Additional ranges are small, fixed-size headers; the ZIP64 extensible
+    data sector does not need to be downloaded.
     """
-    # ZIP64 EOCD Locator is right before the regular EOCD
-    locator_pos = eocd_pos - ZIP64_EOCD_LOCATOR_SIZE
-    if locator_pos < 0:
-        raise BadZipFile("ZIP64 EOCD locator not found (not enough data before EOCD)")
+    records = records or {}
+    pos = _find_eocd_offset(tail)
+    fields = EOCD_STRUCT.unpack_from(tail, pos)
+    comment = tail[pos + EOCD_SIZE : pos + EOCD_SIZE + fields[7]]
+    cd_entry_count, cd_size, cd_offset = fields[4:7]
+    directory_end = file_size - len(tail) + pos
+    locator_offset = directory_end - ZIP64_EOCD_LOCATOR_SIZE
+    locator = b""
+    if locator_offset >= 0:
+        locator = _end_record(tail, file_size, records, locator_offset, ZIP64_EOCD_LOCATOR_SIZE)
 
-    locator_sig = tail[locator_pos : locator_pos + 4]
-    if locator_sig != ZIP64_EOCD_LOCATOR_SIGNATURE:
-        raise BadZipFile("ZIP64 EOCD locator signature mismatch")
-
-    locator_fields = ZIP64_EOCD_LOCATOR_STRUCT.unpack_from(tail, locator_pos)
-    zip64_eocd_abs_offset = locator_fields[2]
-
-    # The ZIP64 EOCD record offset is absolute in the file. Convert to tail-relative.
-    tail_start = file_size - len(tail)
-    zip64_eocd_rel = zip64_eocd_abs_offset - tail_start
-
-    if zip64_eocd_rel < 0 or zip64_eocd_rel + ZIP64_EOCD_SIZE > len(tail):
-        raise BadZipFile("ZIP64 EOCD record is outside the fetched tail data")
-
-    z64_sig = tail[zip64_eocd_rel : zip64_eocd_rel + 4]
-    if z64_sig != ZIP64_EOCD_SIGNATURE:
-        raise BadZipFile("ZIP64 EOCD record signature mismatch")
-
-    z64_fields = ZIP64_EOCD_STRUCT.unpack_from(tail, zip64_eocd_rel)
-    # fields: signature, size_of_record, version_made, version_needed,
-    #         disk_num, disk_cd_start, cd_entries_this_disk,
-    #         cd_entries_total, cd_size, cd_offset
-    cd_entry_count = z64_fields[7]
-    cd_size = z64_fields[8]
-    cd_offset = z64_fields[9]
-
+    if locator.startswith(ZIP64_EOCD_LOCATOR_SIGNATURE):
+        _, disk, relative_record_offset, disks = ZIP64_EOCD_LOCATOR_STRUCT.unpack(locator)
+        if disk or disks > 1:
+            raise BadZipFile("ZIP archives spanning multiple disks are not supported")
+        record_offset = relative_record_offset
+        if record_offset + ZIP64_EOCD_SIZE > locator_offset:
+            raise BadZipFile("Invalid ZIP64 EOCD locator offset")
+        record = _end_record(tail, file_size, records, record_offset, ZIP64_EOCD_SIZE)
+        if not record.startswith(ZIP64_EOCD_SIGNATURE):
+            # Self-extracting ZIPs can store offsets relative to the ZIP,
+            # rather than the containing file. Match zipfile's fallback
+            # for a fixed-size ZIP64 record immediately before the locator.
+            record_offset = locator_offset - ZIP64_EOCD_SIZE
+            record = _end_record(tail, file_size, records, record_offset, ZIP64_EOCD_SIZE)
+        if not record.startswith(ZIP64_EOCD_SIGNATURE):
+            raise BadZipFile("ZIP64 EOCD record signature mismatch")
+        z64 = ZIP64_EOCD_STRUCT.unpack(record)
+        if z64[1] < 44 or record_offset + 12 + z64[1] != locator_offset:
+            raise BadZipFile("Invalid ZIP64 EOCD record size")
+        cd_entry_count, cd_size, cd_offset = z64[7:10]
+        if cd_offset + cd_size != relative_record_offset:
+            raise BadZipFile("Invalid ZIP64 central directory offset or size")
+        directory_end = record_offset
+    # A count of exactly 65535 does not require ZIP64. The locator's
+    # signature, not the count alone, determines whether ZIP64 is present.
+    archive_offset = directory_end - cd_size - cd_offset
+    if cd_offset + archive_offset < 0:
+        raise BadZipFile("Invalid central directory offset or size")
     return EOCDInfo(
-        cd_offset=cd_offset,
+        cd_offset=cd_offset + archive_offset,
         cd_size=cd_size,
         cd_entry_count=cd_entry_count,
+        archive_offset=archive_offset,
+        comment=comment,
     )
 
 
-def parse_central_directory(data: bytes, entry_count: int) -> list[CentralDirEntry]:
-    """Parse all central directory entries from raw bytes.
+def parse_central_directory(data: bytes) -> Iterator[CentralDirEntry]:
+    """Yield central directory entries from raw bytes.
 
     Args:
         data: The raw central directory data.
-        entry_count: Expected number of entries.
 
-    Returns:
-        List of CentralDirEntry objects.
+    Yields:
+        CentralDirEntry objects in directory order. As in zipfile,
+        directory size determines the entries rather than the end record's count.
 
     Raises:
         BadZipFile: If the data is malformed.
     """
-    entries: list[CentralDirEntry] = []
     offset = 0
 
-    for _ in range(entry_count):
+    while offset < len(data):
         if offset + CENTRAL_DIR_SIZE > len(data):
             raise BadZipFile("Central directory is truncated")
 
@@ -202,9 +217,6 @@ def parse_central_directory(data: bytes, entry_count: int) -> list[CentralDirEnt
         var_start = offset + CENTRAL_DIR_SIZE
         var_end = var_start + filename_length + extra_length + comment_length
 
-        if var_end > len(data):
-            raise BadZipFile("Central directory entry extends past end of data")
-
         filename = data[var_start : var_start + filename_length]
         extra = data[var_start + filename_length : var_start + filename_length + extra_length]
         comment = data[
@@ -214,7 +226,7 @@ def parse_central_directory(data: bytes, entry_count: int) -> list[CentralDirEnt
             + comment_length
         ]
 
-        entry = CentralDirEntry(
+        yield CentralDirEntry(
             version_made_by=fields[1],
             version_needed=fields[2],
             flags=fields[3],
@@ -232,17 +244,15 @@ def parse_central_directory(data: bytes, entry_count: int) -> list[CentralDirEnt
             extra=extra,
             comment=comment,
         )
-        entries.append(entry)
         offset = var_end
 
-    return entries
 
-
-def parse_local_file_header(data: bytes) -> LocalHeaderInfo:
+def parse_local_file_header(data: bytes, *, offset: int = 0) -> LocalHeaderInfo:
     """Parse a local file header to determine the data offset.
 
     Args:
         data: At least LOCAL_FILE_HEADER_SIZE bytes of the local header.
+        offset: Position of the header within data.
 
     Returns:
         LocalHeaderInfo with filename and extra field lengths.
@@ -250,10 +260,10 @@ def parse_local_file_header(data: bytes) -> LocalHeaderInfo:
     Raises:
         BadZipFile: If the header is invalid.
     """
-    if len(data) < LOCAL_FILE_HEADER_SIZE:
+    if offset < 0 or len(data) - offset < LOCAL_FILE_HEADER_SIZE:
         raise BadZipFile("Local file header is truncated")
 
-    fields = LOCAL_FILE_HEADER_STRUCT.unpack_from(data, 0)
+    fields = LOCAL_FILE_HEADER_STRUCT.unpack_from(data, offset)
     # fields: signature(0), version_needed(1), flags(2), compression(3),
     #         mod_time(4), mod_date(5), crc32(6), compressed_size(7),
     #         uncompressed_size(8), filename_length(9), extra_length(10)
@@ -264,4 +274,5 @@ def parse_local_file_header(data: bytes) -> LocalHeaderInfo:
     return LocalHeaderInfo(
         filename_length=fields[9],
         extra_length=fields[10],
+        flags=fields[2],
     )

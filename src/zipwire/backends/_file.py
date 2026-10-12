@@ -14,7 +14,7 @@ lazily-opened file handle.
 
 Regular files do not support true non-blocking IO (``epoll``/``select`` and
 ``O_NONBLOCK`` do not apply to them), so ``AsyncFileReader`` offloads every
-blocking call to a worker thread via :func:`asyncio.to_thread` -- the same
+blocking call to the event loop's thread pool -- the same
 strategy libraries such as ``aiofiles`` use internally, without the extra
 dependency.
 """
@@ -24,15 +24,44 @@ from __future__ import annotations
 import asyncio
 import os
 import typing
+from contextvars import copy_context
+from functools import partial
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 from zipwire._constants import STREAM_CHUNK_SIZE
 
 if typing.TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator
 
     from zipwire._types import Headers
+
+_P = typing.ParamSpec("_P")
+_T = typing.TypeVar("_T")
+
+
+async def _file_io(func: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> _T:
+    """Finish a worker operation before propagating cancellation to cleanup."""
+    # An executor future remains waitable when loop shutdown cancels all
+    # tasks. Preserve context variables as asyncio.to_thread does.
+    call = partial(copy_context().run, func, *args, **kwargs)
+    worker = asyncio.get_running_loop().run_in_executor(None, call)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # Cancelling the awaiter cannot stop the thread. Keep the operation
+        # alive and wait for it, including through repeated cancellation,
+        # so cleanup cannot race an unfinished open, read, or close.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                break
+        if not worker.cancelled():
+            worker.exception()
+        raise
 
 
 def _path_from_file_uri(uri: str) -> str:
@@ -131,7 +160,7 @@ class AsyncFileReader:
     """AsyncReader implementation backed by a local file.
 
     Regular files cannot be read without blocking, so every blocking
-    call is offloaded to a worker thread with :func:`asyncio.to_thread`,
+    call is offloaded to the event loop's thread pool,
     keeping the event loop responsive.  A missing path surfaces as
     :exc:`FileNotFoundError`, mirroring how an HTTP 404 surfaces as
     :exc:`OSError` in the network backends.
@@ -166,7 +195,7 @@ class AsyncFileReader:
         return self._size
 
     async def head(self) -> Headers:
-        size = await asyncio.to_thread(self._file_size)
+        size = await _file_io(self._file_size)
         return _stat_headers(size)
 
     async def read_range(self, offset: int, length: int) -> tuple[bytes, Headers]:
@@ -175,7 +204,7 @@ class AsyncFileReader:
             fh.seek(offset)
             return fh.read(length), self._file_size()
 
-        data, size = await asyncio.to_thread(_read)
+        data, size = await _file_io(_read)
         return data, _stat_headers(size)
 
     async def stream_range(self, offset: int, length: int) -> AsyncIterator[bytes]:
@@ -184,20 +213,23 @@ class AsyncFileReader:
             fh.seek(offset)
             return fh
 
-        fh = await asyncio.to_thread(_open_seek)
+        fh = await _file_io(_open_seek)
         remaining = length
         while remaining > 0:
-            chunk = await asyncio.to_thread(fh.read, min(STREAM_CHUNK_SIZE, remaining))
+            chunk = await _file_io(fh.read, min(STREAM_CHUNK_SIZE, remaining))
             if not chunk:
                 break
             remaining -= len(chunk)
             yield chunk
 
     async def close(self) -> None:
-        if self._handle is not None:
-            await asyncio.to_thread(self._handle.close)
-            self._handle = None
-        self._size = None
+        def _close() -> None:
+            if self._handle is not None:
+                self._handle.close()
+                self._handle = None
+            self._size = None
+
+        await _file_io(_close)
 
     async def __aenter__(self) -> AsyncFileReader:
         return self

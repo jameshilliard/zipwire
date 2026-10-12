@@ -81,7 +81,7 @@ class TestPrintTable:
     def test_output_format(self, stored_zip: bytes, capsys) -> None:
         eocd = find_eocd(stored_zip, len(stored_zip))
         cd_data = stored_zip[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = parse_central_directory(cd_data)
         infos = [RemoteZipInfo._from_central_dir_entry(e) for e in entries]
 
         _print_table(infos, skip_dirs=False)
@@ -100,7 +100,7 @@ class TestPrintTable:
     def test_skip_dirs(self, directory_zip: bytes, capsys) -> None:
         eocd = find_eocd(directory_zip, len(directory_zip))
         cd_data = directory_zip[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = parse_central_directory(cd_data)
         infos = [RemoteZipInfo._from_central_dir_entry(e) for e in entries]
 
         _print_table(infos, skip_dirs=True)
@@ -115,7 +115,7 @@ class TestPrintTable:
     def test_show_dirs(self, directory_zip: bytes, capsys) -> None:
         eocd = find_eocd(directory_zip, len(directory_zip))
         cd_data = directory_zip[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = parse_central_directory(cd_data)
         infos = [RemoteZipInfo._from_central_dir_entry(e) for e in entries]
 
         _print_table(infos, skip_dirs=False)

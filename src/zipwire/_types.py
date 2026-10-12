@@ -21,11 +21,15 @@ class Headers(typing.Protocol):
     with lower-case keys.
     """
 
-    def __getitem__(self, key: str) -> str: ...
+    def __getitem__(self, key: str, /) -> str: ...
 
-    def __contains__(self, key: object) -> bool: ...
+    def __contains__(self, key: object, /) -> bool: ...
 
-    def get(self, key: str, default: str | None = None) -> str | None: ...
+    @typing.overload
+    def get(self, key: str, /) -> str | None: ...
+
+    @typing.overload
+    def get(self, key: str, default: str | None, /) -> str | None: ...
 
 
 @typing.runtime_checkable
@@ -60,7 +64,11 @@ class SyncReader(typing.Protocol):
         ...
 
     def stream_range(self, offset: int, length: int) -> Iterator[bytes]:
-        """Stream *length* bytes starting at *offset* as chunks."""
+        """Stream *length* bytes starting at *offset* as chunks.
+
+        If the iterator exposes ``close()``, extraction calls it on exit,
+        including when decoding or writing fails.
+        """
         ...
 
     def close(self) -> None:
@@ -100,7 +108,11 @@ class AsyncReader(typing.Protocol):
         ...
 
     def stream_range(self, offset: int, length: int) -> AsyncIterator[bytes]:
-        """Stream *length* bytes starting at *offset* as chunks."""
+        """Stream *length* bytes starting at *offset* as chunks.
+
+        If the iterator exposes ``aclose()``, extraction awaits it on exit,
+        including when decoding or writing fails.
+        """
         ...
 
     async def close(self) -> None:
@@ -110,6 +122,15 @@ class AsyncReader(typing.Protocol):
 
 @typing.runtime_checkable
 class Writable(typing.Protocol):
-    """Protocol for writable file-like objects (io.BytesIO, io.BufferedWriter, etc.)."""
+    """Synchronous destination accepting bytes from ``read_into``.
 
-    def write(self, data: bytes, /) -> object: ...
+    Return the number of bytes accepted, or ``None`` to indicate that the
+    whole chunk was consumed. Partial writes are retried; zero, negative,
+    or oversized counts raise ``OSError``. Destinations must raise
+    ``BlockingIOError`` if they cannot currently accept data.
+
+    The caller owns the destination and is responsible for flushing and
+    closing it.
+    """
+
+    def write(self, data: bytes, /) -> int | None: ...

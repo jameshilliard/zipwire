@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import bz2
 import io
+import zipfile
 import zlib
 
 import pytest
 
-from tests.conftest import has_zstd, needs_zstd
+from tests.conftest import has_zstd, make_zip, needs_zstd
 from zipwire._decompress import StreamingDecompressor, decompress
 from zipwire._errors import CRCMismatch, FileTooLarge, UnsupportedCompression
 
@@ -161,8 +163,6 @@ def test_streaming_unsupported_method() -> None:
 
 
 def test_decompress_bzip2() -> None:
-    import bz2
-
     original = b"Hello, bzip2 World!" * 50
     compressed = bz2.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
@@ -171,8 +171,6 @@ def test_decompress_bzip2() -> None:
 
 
 def test_streaming_bzip2() -> None:
-    import bz2
-
     original = b"Streaming bzip2 data" * 100
     compressed = bz2.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
@@ -184,8 +182,6 @@ def test_streaming_bzip2() -> None:
 
 
 def test_streaming_bzip2_chunked() -> None:
-    import bz2
-
     original = b"ABCDEFGH" * 500
     compressed = bz2.compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
@@ -200,21 +196,25 @@ def test_streaming_bzip2_chunked() -> None:
 # --- lzma ---
 
 
-def test_decompress_lzma() -> None:
-    import lzma
+def _lzma_payload(data: bytes) -> bytes:
+    archive = make_zip({"file": data}, compression=zipfile.ZIP_LZMA)
+    with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        info = zf.getinfo("file")
+    start = info.header_offset + 30 + len("file")
+    return archive[start : start + info.compress_size]
 
+
+def test_decompress_lzma() -> None:
     original = b"Hello, LZMA World!" * 50
-    compressed = lzma.compress(original)
+    compressed = _lzma_payload(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     result = decompress(compressed, method=14, expected_size=len(original), expected_crc=crc)
     assert result == original
 
 
 def test_streaming_lzma() -> None:
-    import lzma
-
     original = b"Streaming LZMA data" * 100
-    compressed = lzma.compress(original)
+    compressed = _lzma_payload(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=14, expected_crc=crc, dest=dest)
@@ -224,10 +224,8 @@ def test_streaming_lzma() -> None:
 
 
 def test_streaming_lzma_chunked() -> None:
-    import lzma
-
     original = b"ABCDEFGH" * 500
-    compressed = lzma.compress(original)
+    compressed = _lzma_payload(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=14, expected_crc=crc, dest=dest)

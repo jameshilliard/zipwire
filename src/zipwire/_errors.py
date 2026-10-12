@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import zipfile
+
 
 class ZipwireError(Exception):
     """Base exception for all zipwire errors."""
 
 
-class BadZipFile(ZipwireError):
+class BadZipFile(ZipwireError, zipfile.BadZipFile):
     """The data does not appear to be a valid ZIP archive."""
 
 
-class UnsupportedCompression(ZipwireError):
+class UnsupportedCompression(ZipwireError, NotImplementedError):
     """The file uses an unsupported compression method."""
 
     def __init__(self, method: int) -> None:
@@ -19,7 +21,7 @@ class UnsupportedCompression(ZipwireError):
         super().__init__(f"Unsupported compression method: {method}")
 
 
-class CRCMismatch(ZipwireError):
+class CRCMismatch(BadZipFile):
     """CRC-32 check failed after decompression."""
 
     def __init__(self, expected: int, actual: int) -> None:

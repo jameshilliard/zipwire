@@ -35,6 +35,7 @@ class CompressionMethod(IntEnum):
     DEFLATED = 8  # zipfile.ZIP_DEFLATED
     BZIP2 = 12  # zipfile.ZIP_BZIP2
     LZMA = 14  # zipfile.ZIP_LZMA
+    ZSTANDARD_LEGACY = 20
     ZSTANDARD = 93  # zipfile.ZIP_ZSTANDARD (3.14+)
 
 
@@ -119,7 +120,7 @@ LOCAL_FILE_HEADER_STRUCT = struct.Struct(
 # ---------------------------------------------------------------------------
 # Derived / misc
 # ---------------------------------------------------------------------------
-MAX_EOCD_SEARCH = EOCD_SIZE + 65535  # max ZIP comment is 65 535 bytes
+MAX_EOCD_SEARCH = EOCD_SIZE + 65535 + ZIP64_EOCD_LOCATOR_SIZE + ZIP64_EOCD_SIZE
 
 ZIP64_EXTRA_FIELD_ID = 0x0001
 

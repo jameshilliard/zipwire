@@ -4,6 +4,39 @@ Only the central directory and the requested entries are downloaded,
 so large archives can be inspected and partially extracted without
 fetching the entire file.
 
+Archive compatibility
+---------------------
+
+Both APIs read stored, Deflate, Bzip2, and ZIP-LZMA entries. Zstandard
+methods 20 and 93 are supported when ``compression.zstd`` is available.
+ZIP64, prepended executable data, Unicode Path extra fields, and
+traditional ZipCrypto encryption are supported. Pass ``metadata_encoding``
+to the archive constructor for legacy filenames, and ``pwd`` to ``read``
+or ``read_into`` for encrypted entries. ``setpassword()`` sets a default
+password, and ``comment`` exposes the archive comment as bytes.
+
+These features also apply to the wheel subclasses. AES encryption,
+multi-volume archives, Deflate64, and PPMd remain unsupported.
+End-record selection and tolerance of incomplete comments and compressed
+streams follow stdlib ``zipfile``. Returned data is limited to the declared
+uncompressed size and verified against the entry's CRC. Missing optional
+compression modules raise ``RuntimeError`` only when that codec is needed.
+Compressed members continue decoding beyond the output limit to detect
+codec errors, discarding excess output in bounded chunks.
+Invalid LZMA properties raise ``lzma.LZMAError``, as in stdlib ``zipfile``.
+Premature input exhaustion raises ``EOFError`` if decoding still needs
+compressed data. Archives shorter than the minimum end record are rejected
+before any range request.
+
+Archive loading reuses central-directory bytes already present in the
+initial tail. Wheel readers also reuse complete cached members. Size
+limits are checked before issuing member-specific range requests.
+Async reads yield to the asyncio event loop between bounded decoding
+steps, including when all input is already buffered.
+``read_into`` retries partial destination writes and yields between retries
+in async readers. Writers return a positive byte count or ``None`` when
+the whole chunk was consumed; invalid counts raise ``OSError``.
+
 Synchronous example
 -------------------
 
@@ -17,6 +50,9 @@ Synchronous example
         for info in rz.infolist():
             print(f"{info.filename}  {info.file_size} bytes")
         data = rz.read("path/inside/archive.txt")
+
+        # Traditional ZIP passwords are bytes, as in stdlib zipfile.
+        # data = rz.read("encrypted.txt", pwd=b"password")
 
         # Stream a large entry directly to disk
         with open("local.bin", "wb") as fh:
@@ -64,6 +100,9 @@ Local files:
     filesystem through the same API (no extra dependency).  Useful for
     testing or for handling ``file://`` URIs and local paths uniformly
     with HTTP URLs.
+
+``AsyncFileReader`` waits for an active worker operation to finish before
+propagating cancellation, so context-manager cleanup can safely close it.
 
 ::
 

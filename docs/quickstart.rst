@@ -46,6 +46,11 @@ entries:
        with open("output.bin", "wb") as f:
            rz.read_into("big-file.bin", f)
 
+Custom destinations should return the number of bytes written, or
+``None`` if the whole chunk was consumed. Short writes are retried;
+invalid byte counts raise ``OSError``. Destinations that would block
+must raise ``BlockingIOError``.
+
 Read a local archive
 ^^^^^^^^^^^^^^^^^^^^
 
@@ -64,6 +69,37 @@ dependency:
 
    # Or from a file:// URI
    reader = FileReader.from_uri("file:///path/to/archive.zip")
+
+Passwords, filenames, and comments
+----------------------------------
+
+Pass a bytes password to ``read`` or ``read_into`` for traditionally
+encrypted ZIP entries. ``setpassword`` supplies a default for subsequent
+reads; an explicit password overrides it:
+
+.. code-block:: python
+
+   with SyncRemoteZip(reader, metadata_encoding="cp1252") as rz:
+       print(rz.comment)
+       rz.setpassword(b"archive-password")
+       data = rz.read("private.txt")
+       with open("output.bin", "wb") as dest:
+           rz.read_into("other.bin", dest, pwd=b"different-password")
+
+``metadata_encoding`` is only needed for legacy archives whose filenames
+use a code page other than CP437. UTF-8 filenames and valid Unicode Path
+extra fields are decoded automatically. The same options work with
+``AsyncRemoteZip`` and both wheel classes:
+
+.. code-block:: python
+
+   async with AsyncRemoteZip(reader, metadata_encoding="cp1252") as rz:
+       data = await rz.read("private.txt", pwd=b"archive-password")
+
+Stored, Deflate, Bzip2, ZIP-LZMA, and ZIP64 archives are supported.
+Zstandard (including legacy method 20) requires Python's
+``compression.zstd`` module, available from Python 3.14. AES encryption,
+split archives, Deflate64, and PPMd are not supported.
 
 Asynchronous usage
 ------------------
@@ -208,3 +244,32 @@ All backends accept an optional pre-configured client or session:
        )
        with SyncRemoteZip(reader) as rz:
            data = rz.read("secret.txt")
+
+Performance and async scheduling
+--------------------------------
+
+Central-directory data already in the initial tail is reused. Wheel
+readers also serve complete cached members without additional requests.
+``max_file_size`` rejects oversized entries before any member-specific
+range request, using the metadata loaded when the archive was opened.
+
+Async readers yield to the asyncio event loop between bounded decoding
+steps, including when input comes from a cache. Decryption uses smaller
+steps because traditional ZipCrypto executes in Python. These checkpoints
+allow other tasks to run and deliver cancellation without waiting for an
+entire entry to be decoded. Each individual codec call and destination
+``write`` remains synchronous.
+
+The repository includes a local benchmark:
+
+.. code-block:: console
+
+   .venv/bin/python benchmarks/bench_read.py
+
+It reports extraction throughput, event-loop scheduling gaps, range
+request counts, and peak traced allocations. It excludes archive creation
+and network time. Source archives are allocated before memory tracing,
+and native allocations that bypass Python's allocator are not included.
+``--encrypted-zip PATH`` adds a single-entry ZipCrypto archive with the
+test password ``test``. No external ZIP tool is needed to run the default
+benchmark.

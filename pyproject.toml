@@ -66,6 +66,7 @@ packages = ["src/zipwire"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = ["integration: tests that hit real network services (deselect with '-m not integration')"]
 addopts = "-m 'not integration'"
 

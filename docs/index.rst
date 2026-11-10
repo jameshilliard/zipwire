@@ -14,3 +14,9 @@
    :caption: API Reference
 
    api
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Project
+
+   changelog

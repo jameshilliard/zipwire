@@ -29,6 +29,7 @@ Homepage = "https://github.com/tiran/zipwire"
 Documentation = "https://zipwire.readthedocs.io/"
 Source = "https://github.com/tiran/zipwire"
 Issues = "https://github.com/tiran/zipwire/issues"
+Changelog = "https://github.com/tiran/zipwire/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 httpx2 = ["httpx2[http2]>=2"]

@@ -140,6 +140,16 @@ with SyncRemoteZip(FileReader("/path/to/archive.zip")) as rz:
     data = rz.read("path/to/file.txt")
 ```
 
+## Contributing
+
+Contributions are welcome. The issue and pull-request workflow is described in
+[CONTRIBUTING.md](https://github.com/tiran/zipwire/blob/main/CONTRIBUTING.md);
+project setup, commands, code style, and changelog conventions are in
+[AGENTS.md](https://github.com/tiran/zipwire/blob/main/AGENTS.md). Please report
+security problems through
+[private vulnerability reporting](https://github.com/tiran/zipwire/security/advisories/new),
+not a public issue.
+
 ## License
 
 Apache-2.0

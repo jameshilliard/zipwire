@@ -207,15 +207,17 @@ class AsyncRemoteZip(RemoteZipBase):
         sd = StreamingDecompressor(
             info.compress_type,
             info.CRC,
-            dest,
             filename=info.filename,
             max_output_size=max_file_size,
         )
         if prefetched is not None:
-            sd.feed(prefetched)
+            if output := sd.feed(prefetched):
+                dest.write(output)
         else:
             stream = self._reader.stream_range(data_offset, info.compress_size)
             async with aclosing(stream) as chunks:
                 async for chunk in chunks:
-                    sd.feed(chunk)
-        sd.finish()
+                    if output := sd.feed(chunk):
+                        dest.write(output)
+        if output := sd.finish():
+            dest.write(output)

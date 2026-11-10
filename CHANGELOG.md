@@ -17,6 +17,12 @@ releases; they are marked **BREAKING**.
   extraction finishes, fails, or is cancelled, instead of relying on async
   generator finalization.
 
+### Internal
+
+- `StreamingDecompressor` no longer writes to a destination; `feed()` and
+  `finish()` now return decompressed bytes, so the sync and async
+  `read_into()` paths share the CRC and size checks.
+
 ## 0.4.0 - 2026-08-29
 
 ### Added

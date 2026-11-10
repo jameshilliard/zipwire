@@ -12,11 +12,13 @@ import pytest
 has_httpx2 = find_spec("httpx2") is not None
 has_requests = find_spec("requests") is not None
 has_aiohttp = find_spec("aiohttp") is not None
+has_anyio = find_spec("anyio") is not None
 has_zstd = find_spec("compression") is not None and find_spec("compression.zstd") is not None
 
 needs_httpx2 = pytest.mark.skipif(not has_httpx2, reason="httpx2 not installed")
 needs_requests = pytest.mark.skipif(not has_requests, reason="requests not installed")
 needs_aiohttp = pytest.mark.skipif(not has_aiohttp, reason="aiohttp not installed")
+needs_anyio = pytest.mark.skipif(not has_anyio, reason="anyio not installed")
 needs_zstd = pytest.mark.skipif(not has_zstd, reason="compression.zstd not available")
 
 

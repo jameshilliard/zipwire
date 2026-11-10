@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import typing
 from contextlib import aclosing
+from inspect import isawaitable
 
 from zipwire._base import RemoteZipBase
 from zipwire._constants import (
@@ -17,7 +18,9 @@ from zipwire._parser import find_eocd, parse_local_file_header
 from zipwire._zipinfo import RemoteZipInfo
 
 if typing.TYPE_CHECKING:
-    from zipwire._types import AsyncReader, Writable
+    from collections.abc import AsyncGenerator
+
+    from zipwire._types import AsyncReader, AsyncWritable, Writable
 
 
 class AsyncRemoteZip(RemoteZipBase):
@@ -168,7 +171,7 @@ class AsyncRemoteZip(RemoteZipBase):
     async def read_into(
         self,
         name: str | RemoteZipInfo,
-        dest: Writable,
+        dest: Writable | AsyncWritable,
         *,
         max_file_size: int | None = None,
     ) -> None:
@@ -185,14 +188,27 @@ class AsyncRemoteZip(RemoteZipBase):
         The streamed response is closed when extraction finishes, fails,
         or is cancelled.
 
+        If ``dest.write()`` returns an awaitable, it is awaited before the
+        next chunk is read or decompressed, so a slow destination applies
+        backpressure to the transfer.  Synchronous destinations such as
+        :class:`io.BytesIO` are supported, too.  Their writes run on the
+        event-loop thread. Each write must accept the whole chunk or raise
+        an exception; a short write is not retried.
+
+        The caller owns *dest*: this method does not flush, close, or
+        commit it.  Errors and cancellation may leave partial output; only
+        a successful return indicates that CRC-32 verification passed.
+
         .. versionchanged:: 0.5.0
 
            The response is now closed deterministically instead of relying
-           on async-generator finalization.
+           on async-generator finalization, and *dest* may be an
+           asynchronous writable object.
 
         Args:
             name: Filename string or RemoteZipInfo object.
-            dest: A writable file-like object (e.g. ``io.BytesIO``, open file).
+            dest: A synchronous or asynchronous writable object, such as
+                ``io.BytesIO``, an open file, or ``anyio.AsyncFile``.
             max_file_size: Optional limit on uncompressed size in bytes.
                 Raises :exc:`~zipwire.FileTooLarge` if the entry's
                 ``file_size`` exceeds this limit, or if the actual
@@ -204,6 +220,28 @@ class AsyncRemoteZip(RemoteZipBase):
         info, data_offset, prefetched = resolved
         if max_file_size is not None and info.file_size > max_file_size:
             raise FileTooLarge(info.filename, info.file_size, max_file_size)
+        outputs = self._output_chunks(info, data_offset, prefetched, max_file_size)
+        async with aclosing(outputs) as chunks:
+            async for output in chunks:
+                written = dest.write(output)
+                # Sync file writes return the byte count; skip the costlier
+                # awaitable probe for the common case.
+                if type(written) is not int and isawaitable(written):
+                    await written
+
+    async def _output_chunks(
+        self,
+        info: RemoteZipInfo,
+        data_offset: int,
+        prefetched: bytes | None,
+        max_file_size: int | None,
+    ) -> AsyncGenerator[bytes, None]:
+        """Decompress one entry and yield its nonempty output chunks.
+
+        The compressed payload is streamed from the reader and decompressed
+        incrementally.  The streamed response is closed as soon as the
+        generator is closed, whether it finished, failed, or was cancelled.
+        """
         sd = StreamingDecompressor(
             info.compress_type,
             info.CRC,
@@ -212,12 +250,12 @@ class AsyncRemoteZip(RemoteZipBase):
         )
         if prefetched is not None:
             if output := sd.feed(prefetched):
-                dest.write(output)
+                yield output
         else:
             stream = self._reader.stream_range(data_offset, info.compress_size)
             async with aclosing(stream) as chunks:
                 async for chunk in chunks:
                     if output := sd.feed(chunk):
-                        dest.write(output)
+                        yield output
         if output := sd.finish():
-            dest.write(output)
+            yield output

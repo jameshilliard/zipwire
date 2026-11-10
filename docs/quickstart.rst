@@ -149,6 +149,31 @@ Async streaming to disk
 
    asyncio.run(main())
 
+:meth:`~zipwire.AsyncRemoteZip.read_into` also accepts asynchronous
+writable objects, such as ``anyio.AsyncFile``.  When ``write()`` returns
+an awaitable, zipwire waits for that write to finish before it reads more
+input, so a slow destination throttles the download.  Any object with an
+awaitable ``write()`` works; the example uses anyio:
+
+.. code-block:: python
+
+   import asyncio
+
+   import anyio
+
+   from zipwire import AsyncRemoteZip
+   from zipwire.backends import AiohttpReader
+
+
+   async def main():
+       reader = AiohttpReader("https://archive.example/large.zip")
+       async with AsyncRemoteZip(reader) as rz:
+           async with await anyio.open_file("output.bin", "wb") as f:
+               await rz.read_into("big-file.bin", f)
+
+
+   asyncio.run(main())
+
 Wheel dist-info metadata
 ------------------------
 

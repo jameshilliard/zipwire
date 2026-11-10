@@ -28,6 +28,9 @@ Asynchronous example
 ::
 
     import asyncio
+
+    import anyio
+
     from zipwire import AsyncRemoteZip
     from zipwire.backends import AiohttpReader
 
@@ -39,6 +42,10 @@ Asynchronous example
 
             # Stream a large entry directly to disk
             with open("local.bin", "wb") as fh:
+                await rz.read_into("large-file.bin", fh)
+
+            # ... or to an asynchronous writable object
+            async with await anyio.open_file("local.bin", "wb") as fh:
                 await rz.read_into("large-file.bin", fh)
 
     asyncio.run(main())
@@ -113,7 +120,7 @@ from zipwire._errors import (
 )
 from zipwire._parser import EOCDInfo
 from zipwire._sync import SyncRemoteZip
-from zipwire._types import AsyncReader, Headers, SyncReader, Writable
+from zipwire._types import AsyncReader, AsyncWritable, Headers, SyncReader, Writable
 from zipwire._wheel import AsyncRemoteWheel, SyncRemoteWheel
 from zipwire._zipinfo import RemoteZipInfo
 
@@ -121,6 +128,7 @@ __all__ = [
     "AsyncReader",
     "AsyncRemoteWheel",
     "AsyncRemoteZip",
+    "AsyncWritable",
     "BadZipFile",
     "CRCMismatch",
     "CompressionMethod",

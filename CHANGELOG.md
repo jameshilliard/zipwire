@@ -8,6 +8,13 @@ releases; they are marked **BREAKING**.
 
 ## Unreleased
 
+### Added
+
+- `AsyncRemoteZip.read_into()` accepts asynchronous writable objects
+  implementing the new `AsyncWritable` protocol, such as `anyio.AsyncFile`.
+  If `write()` returns an awaitable, zipwire awaits it before reading more
+  input, so a slow destination applies backpressure to the transfer.
+
 ### Changed
 
 - **BREAKING:** `AsyncReader.stream_range()` now returns

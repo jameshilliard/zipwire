@@ -124,3 +124,19 @@ class Writable(typing.Protocol):
     """Protocol for writable file-like objects (io.BytesIO, io.BufferedWriter, etc.)."""
 
     def write(self, data: bytes, /) -> object: ...
+
+
+class AsyncWritable(typing.Protocol):
+    """Protocol for asynchronous writable objects (anyio.AsyncFile, etc.).
+
+    ``write()`` returns an awaitable that resolves once the chunk has been
+    accepted; it must consume the whole chunk or raise an exception.
+    Zipwire awaits it before producing more output, so a slow destination
+    applies backpressure to the transfer.
+
+    The protocol is for static typing only.  Synchronous destinations also
+    have a ``write`` attribute, so a runtime ``isinstance()`` check cannot
+    tell them apart; zipwire awaits the return value when it is awaitable.
+    """
+
+    def write(self, data: bytes, /) -> typing.Awaitable[object]: ...

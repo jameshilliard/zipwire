@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import typing
 import zipfile
 
 import pytest
@@ -11,6 +12,9 @@ from tests.conftest import MockAsyncReader
 from zipwire import AsyncRemoteZip, EOCDInfo
 from zipwire._errors import FileNotFoundInZip, FileTooLarge, RangeRequestUnsupported
 from zipwire._zipinfo import RemoteZipInfo
+
+if typing.TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 
 class TestAsyncRemoteZip:
@@ -258,6 +262,29 @@ class TestAsyncRemoteZip:
             dest = io.BytesIO()
             await rz.read_into("large.bin", dest)
         assert dest.getvalue() == expected
+
+    async def test_read_into_closes_stream_on_error(self, large_file_zip: bytes) -> None:
+        """Close the response generator when writing fails mid-stream."""
+
+        class ClosingReader(MockAsyncReader):
+            stream_closed = False
+
+            async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
+                try:
+                    async for chunk in super().stream_range(offset, length):
+                        yield chunk
+                finally:
+                    self.stream_closed = True
+
+        class FailingDest:
+            def write(self, data: bytes) -> None:
+                raise OSError("write failed")
+
+        reader = ClosingReader(large_file_zip)
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(OSError, match="write failed"):
+                await rz.read_into("large.bin", FailingDest())
+        assert reader.stream_closed
 
     async def test_read_zstandard(self, zstandard_zip: bytes) -> None:
         reader = MockAsyncReader(zstandard_zip)

@@ -184,6 +184,11 @@ protocol and pass an instance to :class:`~zipwire.SyncRemoteZip` or
 See the :class:`~zipwire.SyncReader` and :class:`~zipwire.AsyncReader`
 protocol definitions for the full method signatures.
 
+An asynchronous reader's ``stream_range()`` must return an async generator.
+Zipwire closes it with :func:`contextlib.aclosing` when extraction finishes,
+fails, or is cancelled, so a custom backend can release its HTTP response in
+a ``finally`` block or an async context manager.
+
 Why only absolute byte ranges?
 -------------------------------
 

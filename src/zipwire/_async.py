@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import typing
+from contextlib import aclosing
 
 from zipwire._base import RemoteZipBase
 from zipwire._constants import (
@@ -181,6 +182,14 @@ class AsyncRemoteZip(RemoteZipBase):
         decompression, aborting if the actual output exceeds the limit
         regardless of what the entry metadata claims.
 
+        The streamed response is closed when extraction finishes, fails,
+        or is cancelled.
+
+        .. versionchanged:: 0.5.0
+
+           The response is now closed deterministically instead of relying
+           on async-generator finalization.
+
         Args:
             name: Filename string or RemoteZipInfo object.
             dest: A writable file-like object (e.g. ``io.BytesIO``, open file).
@@ -205,6 +214,8 @@ class AsyncRemoteZip(RemoteZipBase):
         if prefetched is not None:
             sd.feed(prefetched)
         else:
-            async for chunk in self._reader.stream_range(data_offset, info.compress_size):
-                sd.feed(chunk)
+            stream = self._reader.stream_range(data_offset, info.compress_size)
+            async with aclosing(stream) as chunks:
+                async for chunk in chunks:
+                    sd.feed(chunk)
         sd.finish()

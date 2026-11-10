@@ -45,7 +45,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 if typing.TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncGenerator, Iterator
 
 
 def make_zip(files: dict[str, bytes], *, compression: int = zipfile.ZIP_STORED) -> bytes:
@@ -138,7 +138,7 @@ class MockAsyncReader:
         headers = {"content-range": f"bytes {offset}-{end}/{total}"}
         return chunk, headers
 
-    async def stream_range(self, offset: int, length: int) -> AsyncIterator[bytes]:
+    async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
         data = self.data[offset : offset + length]
         chunk_size = 1024
         for pos in range(0, len(data), chunk_size):

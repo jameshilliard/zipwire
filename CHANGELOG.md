@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 zipwire is pre-1.0, so backwards-incompatible changes can occur in minor
 releases; they are marked **BREAKING**.
 
+## Unreleased
+
+### Changed
+
+- **BREAKING:** `AsyncReader.stream_range()` now returns
+  `AsyncGenerator[bytes, None]` instead of `AsyncIterator[bytes]`. Custom
+  async backends must return an async generator so zipwire can close it.
+- `AsyncRemoteZip` now closes the streamed response deterministically when
+  extraction finishes, fails, or is cancelled, instead of relying on async
+  generator finalization.
+
 ## 0.4.0 - 2026-08-29
 
 ### Added

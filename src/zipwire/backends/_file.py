@@ -30,7 +30,7 @@ from urllib.request import url2pathname
 from zipwire._constants import STREAM_CHUNK_SIZE
 
 if typing.TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncGenerator, Iterator
 
     from zipwire._types import Headers
 
@@ -178,7 +178,7 @@ class AsyncFileReader:
         data, size = await asyncio.to_thread(_read)
         return data, _stat_headers(size)
 
-    async def stream_range(self, offset: int, length: int) -> AsyncIterator[bytes]:
+    async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
         def _open_seek() -> typing.BinaryIO:
             fh = self._open()
             fh.seek(offset)

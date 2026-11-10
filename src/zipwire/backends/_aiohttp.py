@@ -16,7 +16,7 @@ from zipwire._constants import STREAM_CHUNK_SIZE, range_header
 from zipwire._errors import RangeRequestUnsupported
 
 if typing.TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from zipwire._types import Headers
 
@@ -70,7 +70,7 @@ class AiohttpReader:
                 )
             return await resp.read(), resp.headers
 
-    async def stream_range(self, offset: int, length: int) -> AsyncIterator[bytes]:
+    async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
         logger.debug(
             "GET stream %s %s (%d bytes)", self._url, range_header(offset, length), length
         )

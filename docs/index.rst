@@ -19,4 +19,5 @@
    :maxdepth: 2
    :caption: Project
 
+   scope
    changelog

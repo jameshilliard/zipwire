@@ -2,17 +2,41 @@
 
 from __future__ import annotations
 
+import asyncio
+import bz2
 import io
+import lzma
+import typing
 import zlib
 
 import pytest
 
 from tests.conftest import has_zstd, needs_zstd
-from zipwire._decompress import StreamingDecompressor, decompress
-from zipwire._errors import CRCMismatch, FileTooLarge, UnsupportedCompression
+from zipwire._constants import STREAM_CHUNK_SIZE
+from zipwire._decompress import StreamingDecompressor, adecompress, decompress
+from zipwire._errors import (
+    CRCMismatch,
+    FileTooLarge,
+    SizeMismatch,
+    TruncatedStream,
+    UnsupportedCompression,
+)
+
+if typing.TYPE_CHECKING:
+    from collections.abc import Callable
 
 if has_zstd:
     from compression import zstd
+
+if has_zstd:
+
+    def _zstd_compress(data: bytes) -> bytes:
+        return zstd.compress(data)
+
+else:
+
+    def _zstd_compress(data: bytes) -> bytes:  # pragma: no cover
+        raise AssertionError("zstandard is not available")
 
 # --- decompress() ---
 
@@ -74,7 +98,7 @@ def test_streaming_stored_simple() -> None:
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=0, expected_crc=crc)
     dest.write(sd.feed(data))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == data
 
 
@@ -83,7 +107,7 @@ def test_streaming_stored_empty() -> None:
     crc = zlib.crc32(data) & 0xFFFFFFFF
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=0, expected_crc=crc)
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == b""
 
 
@@ -93,7 +117,7 @@ def test_streaming_stored_binary() -> None:
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=0, expected_crc=crc)
     dest.write(sd.feed(data))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == data
 
 
@@ -104,7 +128,7 @@ def test_streaming_stored_chunked() -> None:
     sd = StreamingDecompressor(method=0, expected_crc=crc)
     for pos in range(0, len(data), 100):
         dest.write(sd.feed(data[pos : pos + 100]))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == data
 
 
@@ -115,7 +139,7 @@ def test_streaming_deflated_simple() -> None:
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=8, expected_crc=crc)
     dest.write(sd.feed(compressed))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == original
 
 
@@ -126,7 +150,7 @@ def test_streaming_deflated_repeated() -> None:
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=8, expected_crc=crc)
     dest.write(sd.feed(compressed))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == original
 
 
@@ -138,7 +162,7 @@ def test_streaming_deflated_chunked() -> None:
     sd = StreamingDecompressor(method=8, expected_crc=crc)
     for pos in range(0, len(compressed), 100):
         dest.write(sd.feed(compressed[pos : pos + 100]))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == original
 
 
@@ -148,7 +172,7 @@ def test_streaming_crc_mismatch() -> None:
     sd = StreamingDecompressor(method=0, expected_crc=0xDEADBEEF)
     dest.write(sd.feed(data))
     with pytest.raises(CRCMismatch):
-        dest.write(sd.finish())
+        sd.finish()
 
 
 def test_streaming_unsupported_method() -> None:
@@ -178,7 +202,7 @@ def test_streaming_bzip2() -> None:
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=12, expected_crc=crc)
     dest.write(sd.feed(compressed))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == original
 
 
@@ -192,7 +216,7 @@ def test_streaming_bzip2_chunked() -> None:
     sd = StreamingDecompressor(method=12, expected_crc=crc)
     for pos in range(0, len(compressed), 100):
         dest.write(sd.feed(compressed[pos : pos + 100]))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == original
 
 
@@ -218,7 +242,7 @@ def test_streaming_lzma() -> None:
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=14, expected_crc=crc)
     dest.write(sd.feed(compressed))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == original
 
 
@@ -232,7 +256,7 @@ def test_streaming_lzma_chunked() -> None:
     sd = StreamingDecompressor(method=14, expected_crc=crc)
     for pos in range(0, len(compressed), 100):
         dest.write(sd.feed(compressed[pos : pos + 100]))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == original
 
 
@@ -256,7 +280,7 @@ def test_streaming_zstandard() -> None:
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=93, expected_crc=crc)
     dest.write(sd.feed(compressed))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == original
 
 
@@ -269,7 +293,7 @@ def test_streaming_zstandard_chunked() -> None:
     sd = StreamingDecompressor(method=93, expected_crc=crc)
     for pos in range(0, len(compressed), 100):
         dest.write(sd.feed(compressed[pos : pos + 100]))
-    dest.write(sd.finish())
+    sd.finish()
     assert dest.getvalue() == original
 
 
@@ -298,7 +322,7 @@ def test_streaming_zstandard_crc_mismatch() -> None:
     sd = StreamingDecompressor(method=93, expected_crc=0xDEADBEEF)
     dest.write(sd.feed(compressed))
     with pytest.raises(CRCMismatch):
-        dest.write(sd.finish())
+        sd.finish()
 
 
 # --- FileTooLarge ---
@@ -311,3 +335,190 @@ def test_streaming_file_too_large() -> None:
     sd = StreamingDecompressor(method=0, expected_crc=crc, max_output_size=10)
     with pytest.raises(FileTooLarge):
         dest.write(sd.feed(data))
+
+
+# --- bounded streaming output ---
+
+
+def _deflate_compress(data: bytes) -> bytes:
+    return zlib.compress(data, level=6)[2:-4]
+
+
+@pytest.mark.parametrize(
+    ("method", "compress"),
+    [
+        (8, _deflate_compress),
+        (12, bz2.compress),
+        (14, lzma.compress),
+        pytest.param(93, _zstd_compress, marks=needs_zstd),
+    ],
+    ids=["deflated", "bzip2", "lzma", "zstandard"],
+)
+def test_feed_chunks_are_bounded(method: int, compress: Callable[[bytes], bytes]) -> None:
+    """A highly compressible entry cannot inflate into one huge chunk."""
+    original = b"\0" * (2 * STREAM_CHUNK_SIZE + 123)
+    compressed = compress(original)
+    crc = zlib.crc32(original) & 0xFFFFFFFF
+    sd = StreamingDecompressor(method, expected_crc=crc)
+    chunks = list(sd.feed_chunks(compressed))
+    assert max(map(len, chunks)) <= STREAM_CHUNK_SIZE
+    assert b"".join(chunks) == original
+    assert sd.finish() is None
+
+
+def test_stored_feed_chunks_are_bounded() -> None:
+    original = b"x" * (2 * STREAM_CHUNK_SIZE + 1)
+    crc = zlib.crc32(original) & 0xFFFFFFFF
+    sd = StreamingDecompressor(method=0, expected_crc=crc)
+    chunks = list(sd.feed_chunks(original))
+    assert [len(chunk) for chunk in chunks] == [STREAM_CHUNK_SIZE, STREAM_CHUNK_SIZE, 1]
+    assert sd.finish() is None
+
+
+def test_feed_chunks_yields_empty_step() -> None:
+    """Steps without output are still yielded as scheduling checkpoints."""
+    original = b"checkpoint" * 100
+    compressed = bz2.compress(original)
+    crc = zlib.crc32(original) & 0xFFFFFFFF
+    sd = StreamingDecompressor(method=12, expected_crc=crc)
+    assert list(sd.feed_chunks(compressed[:3])) == [b""]
+    assert sd.feed(compressed[3:]) == original
+    assert sd.finish() is None
+
+
+async def test_adecompress_stored() -> None:
+    data = bytes(range(256)) * 100
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+    assert await adecompress(data, method=0, expected_size=len(data), expected_crc=crc) == data
+    with pytest.raises(CRCMismatch):
+        await adecompress(data, method=0, expected_size=len(data), expected_crc=0xDEADBEEF)
+
+
+async def test_adecompress_yields_to_event_loop() -> None:
+    """Decoding a large entry is split so other tasks can run."""
+    original = b"\0" * (2 * STREAM_CHUNK_SIZE)
+    compressed = _deflate_compress(original)
+    crc = zlib.crc32(original) & 0xFFFFFFFF
+    observed = False
+
+    async def observer() -> None:
+        nonlocal observed
+        observed = True
+
+    task = asyncio.create_task(observer())
+    try:
+        result = await adecompress(
+            compressed, method=8, expected_size=len(original), expected_crc=crc
+        )
+        assert result == original
+        assert observed
+    finally:
+        await task
+
+
+# --- truncated streams and size mismatches ---
+
+
+def test_decompress_size_mismatch() -> None:
+    data = b"Hello, World!"
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+    with pytest.raises(SizeMismatch):
+        decompress(data, method=0, expected_size=len(data) - 1, expected_crc=crc)
+
+
+def test_stored_feed_returns_input_buffer() -> None:
+    """STORED feed() hands the buffer through instead of copying it."""
+    data = b"A" * (STREAM_CHUNK_SIZE + 1)
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+    sd = StreamingDecompressor(method=0, expected_crc=crc)
+    assert sd.feed(data) is data
+
+
+def test_streaming_expected_size() -> None:
+    original = b"Hello, World!" * 10
+    compressed = _deflate_compress(original)
+    crc = zlib.crc32(original) & 0xFFFFFFFF
+    sd = StreamingDecompressor(method=8, expected_crc=crc, expected_size=len(original))
+    sd.feed(compressed)
+    assert sd.finish() is None
+
+
+def test_streaming_expected_size_mismatch() -> None:
+    original = b"Hello, World!" * 10
+    compressed = _deflate_compress(original)
+    crc = zlib.crc32(original) & 0xFFFFFFFF
+    sd = StreamingDecompressor(method=8, expected_crc=crc, expected_size=len(original) + 1)
+    sd.feed(compressed)
+    with pytest.raises(SizeMismatch):
+        sd.finish()
+
+
+@pytest.mark.parametrize("method", [0, 8], ids=["stored", "deflated"])
+def test_streaming_expected_size_exceeded_during_feed(method: int) -> None:
+    """Output beyond the expected size is rejected while it is produced."""
+    original = b"Hello, World!" * 100
+    if method == 0:
+        payload: bytes = original
+    else:
+        payload = _deflate_compress(original)
+    crc = zlib.crc32(original) & 0xFFFFFFFF
+    sd = StreamingDecompressor(method=method, expected_crc=crc, expected_size=10)
+    with pytest.raises(SizeMismatch):
+        sd.feed(payload)
+
+
+def test_streaming_finish_truncated() -> None:
+    """A compressed stream that never reaches its end is rejected."""
+    original = b"Hello, World!" * 10
+    compressed = _deflate_compress(original)
+    crc = zlib.crc32(original) & 0xFFFFFFFF
+    sd = StreamingDecompressor(method=8, expected_crc=crc)
+    sd.feed(compressed[: len(compressed) // 2])
+    with pytest.raises(TruncatedStream, match="truncated"):
+        sd.finish()
+
+
+@pytest.mark.parametrize(
+    ("method", "compress"),
+    [
+        (8, _deflate_compress),
+        (12, bz2.compress),
+        (14, lzma.compress),
+        pytest.param(93, _zstd_compress, marks=needs_zstd),
+    ],
+    ids=["deflated", "bzip2", "lzma", "zstandard"],
+)
+def test_streaming_feed_after_end_raises(method: int, compress: Callable[[bytes], bytes]) -> None:
+    """Input past the end of the stream is rejected instead of dropped."""
+    original = b"trailing data test" * 100
+    compressed = compress(original)
+    crc = zlib.crc32(original) & 0xFFFFFFFF
+    sd = StreamingDecompressor(method, expected_crc=crc)
+    sd.feed(compressed)
+    assert sd.eof
+    with pytest.raises(TruncatedStream, match="after end"):
+        sd.feed(b"trailing garbage")
+    # An empty feed after the end stays harmless.
+    assert list(sd.feed_chunks(b"")) == []
+
+
+async def test_adecompress_truncated() -> None:
+    """A truncated stream with a CRC matching the partial output is rejected.
+
+    Without the end-of-stream check, ``adecompress()`` returned the
+    partial output for this input.
+    """
+    original = b"Hello, World!" * 10
+    compressed = _deflate_compress(original)
+    part = compressed[: len(compressed) // 2]
+    partial = zlib.decompressobj(-15).decompress(part)
+    crc = zlib.crc32(partial) & 0xFFFFFFFF
+    with pytest.raises(TruncatedStream):
+        await adecompress(part, method=8, expected_size=len(partial), expected_crc=crc)
+
+
+async def test_adecompress_size_mismatch() -> None:
+    data = b"Hello, World!"
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+    with pytest.raises(SizeMismatch):
+        await adecompress(data, method=0, expected_size=len(data) + 5, expected_crc=crc)

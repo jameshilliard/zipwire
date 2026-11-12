@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import typing
 from contextlib import aclosing
 from inspect import isawaitable
@@ -12,7 +13,7 @@ from zipwire._constants import (
     PREFETCH_EXTRA,
     PREFETCH_THRESHOLD,
 )
-from zipwire._decompress import StreamingDecompressor, decompress
+from zipwire._decompress import StreamingDecompressor, adecompress
 from zipwire._errors import FileTooLarge, RangeRequestUnsupported
 from zipwire._parser import find_eocd, parse_local_file_header
 from zipwire._zipinfo import RemoteZipInfo
@@ -152,6 +153,9 @@ class AsyncRemoteZip(RemoteZipBase):
             *max_file_size*, but a crafted archive may lie about its
             uncompressed size.  Use :meth:`read_into` for defence in
             depth: it enforces the size limit during decompression.
+            A truncated stream raises :exc:`~zipwire.TruncatedStream`,
+            and a decompressed size that differs from the declared
+            ``file_size`` raises :exc:`~zipwire.SizeMismatch`.
         """
         resolved = await self._resolve_entry(name)
         if resolved is None:
@@ -161,7 +165,7 @@ class AsyncRemoteZip(RemoteZipBase):
             raise FileTooLarge(info.filename, info.file_size, max_file_size)
         if prefetched is None:
             prefetched, _ = await self._reader.read_range(data_offset, info.compress_size)
-        return decompress(
+        return await adecompress(
             prefetched,
             info.compress_type,
             info.file_size,
@@ -180,10 +184,17 @@ class AsyncRemoteZip(RemoteZipBase):
         Unlike :meth:`read`, this truly streams: the compressed payload is
         fetched in chunks via :meth:`stream_range` and each chunk is
         decompressed and written immediately, keeping peak memory low.
+        Decompressed output is handed to *dest* in chunks of at most
+        2 MiB, even when the entry expands far beyond its compressed size.
 
         The streaming decompressor also enforces *max_file_size* during
         decompression, aborting if the actual output exceeds the limit
-        regardless of what the entry metadata claims.
+        regardless of what the entry metadata claims.  A compressed
+        stream that ends prematurely raises
+        :exc:`~zipwire.TruncatedStream`.  Decompressed output beyond the
+        declared ``file_size`` aborts the transfer and raises
+        :exc:`~zipwire.SizeMismatch`; a shortfall is detected once the
+        stream ends.
 
         The streamed response is closed when extraction finishes, fails,
         or is cancelled.
@@ -197,7 +208,8 @@ class AsyncRemoteZip(RemoteZipBase):
 
         The caller owns *dest*: this method does not flush, close, or
         commit it.  Errors and cancellation may leave partial output; only
-        a successful return indicates that CRC-32 verification passed.
+        a successful return indicates that the stream ended cleanly and
+        the CRC-32 and size checks passed.
 
         .. versionchanged:: 0.5.0
 
@@ -223,11 +235,15 @@ class AsyncRemoteZip(RemoteZipBase):
         outputs = self._output_chunks(info, data_offset, prefetched, max_file_size)
         async with aclosing(outputs) as chunks:
             async for output in chunks:
+                if not output:
+                    await asyncio.sleep(0)  # yield to loop
+                    continue
                 written = dest.write(output)
                 # Sync file writes return the byte count; skip the costlier
                 # awaitable probe for the common case.
                 if type(written) is not int and isawaitable(written):
                     await written
+                await asyncio.sleep(0)  # yield to loop
 
     async def _output_chunks(
         self,
@@ -236,26 +252,28 @@ class AsyncRemoteZip(RemoteZipBase):
         prefetched: bytes | None,
         max_file_size: int | None,
     ) -> AsyncGenerator[bytes, None]:
-        """Decompress one entry and yield its nonempty output chunks.
+        """Decompress one entry and yield its output chunks.
 
-        The compressed payload is streamed from the reader and decompressed
-        incrementally.  The streamed response is closed as soon as the
-        generator is closed, whether it finished, failed, or was cancelled.
+        Output chunks are bounded by the decompressor, and empty chunks
+        mark decoding steps that produced no bytes.  The compressed
+        payload is streamed from the reader; the streamed response is
+        closed as soon as the generator is closed, whether it finished,
+        failed, or was cancelled.
         """
         sd = StreamingDecompressor(
             info.compress_type,
             info.CRC,
             filename=info.filename,
             max_output_size=max_file_size,
+            expected_size=info.file_size,
         )
         if prefetched is not None:
-            if output := sd.feed(prefetched):
+            for output in sd.feed_chunks(prefetched):
                 yield output
         else:
             stream = self._reader.stream_range(data_offset, info.compress_size)
             async with aclosing(stream) as chunks:
                 async for chunk in chunks:
-                    if output := sd.feed(chunk):
+                    for output in sd.feed_chunks(chunk):
                         yield output
-        if output := sd.finish():
-            yield output
+        sd.finish()

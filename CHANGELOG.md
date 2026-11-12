@@ -24,11 +24,22 @@ releases; they are marked **BREAKING**.
   extraction finishes, fails, or is cancelled, instead of relying on async
   generator finalization.
 
+### Security
+
+- Streaming decompression now yields output in chunks of at most 2 MiB,
+  verifies that compressed streams end cleanly and that the output matches
+  the entry's declared size, and hands control back to the event loop
+  between chunks. Truncated or mismatched output is rejected with the new
+  `TruncatedStream` and `SizeMismatch` exceptions, so a crafted archive
+  can neither force a huge allocation nor make zipwire return damaged
+  data. Credits to James Hilliard for the original implementation.
+
 ### Internal
 
-- `StreamingDecompressor` no longer writes to a destination; `feed()` and
-  `finish()` now return decompressed bytes, so the sync and async
-  `read_into()` paths share the CRC and size checks.
+- `StreamingDecompressor` no longer writes to a destination; `feed()`
+  returns decompressed bytes and `finish()` verifies that the stream ended
+  cleanly and checks the CRC-32 and expected size without returning data,
+  so the sync and async `read_into()` paths share these checks.
 
 ## 0.4.0 - 2026-08-29
 

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import typing
 import zipfile
 
 import pytest
 
-from tests.conftest import MockAsyncReader
+from tests.conftest import MockAsyncReader, make_zip
 from zipwire import AsyncRemoteZip, EOCDInfo
+from zipwire._constants import STREAM_CHUNK_SIZE
 from zipwire._errors import FileNotFoundInZip, FileTooLarge, RangeRequestUnsupported
 from zipwire._zipinfo import RemoteZipInfo
 
@@ -262,6 +264,57 @@ class TestAsyncRemoteZip:
             dest = io.BytesIO()
             await rz.read_into("large.bin", dest)
         assert dest.getvalue() == expected
+
+    async def test_read_into_bounded_output_chunks(self) -> None:
+        """Decoded output reaches the destination in bounded chunks."""
+        content = b"\0" * (2 * STREAM_CHUNK_SIZE + 123)
+        sizes: list[int] = []
+        output = bytearray()
+
+        class Destination:
+            def write(self, chunk: bytes) -> int:
+                sizes.append(len(chunk))
+                output.extend(chunk)
+                return len(chunk)
+
+        archive_data = make_zip({"entry.bin": content}, compression=zipfile.ZIP_DEFLATED)
+        async with AsyncRemoteZip(MockAsyncReader(archive_data)) as rz:
+            await rz.read_into("entry.bin", Destination())
+        assert bytes(output) == content
+        assert max(sizes) <= STREAM_CHUNK_SIZE
+
+    async def test_read_into_yields_to_event_loop(self) -> None:
+        """A synchronous destination must not block the loop between chunks."""
+        content = b"\0" * (3 * STREAM_CHUNK_SIZE)
+        order: list[str] = []
+
+        class Destination:
+            def __init__(self) -> None:
+                self.data = bytearray()
+
+            def write(self, chunk: bytes) -> int:
+                order.append("write")
+                self.data.extend(chunk)
+                return len(chunk)
+
+        async def observer() -> None:
+            while True:
+                order.append("observer")
+                await asyncio.sleep(0)
+
+        archive_data = make_zip({"entry.bin": content}, compression=zipfile.ZIP_DEFLATED)
+        destination = Destination()
+        async with AsyncRemoteZip(MockAsyncReader(archive_data)) as rz:
+            task = asyncio.create_task(observer())
+            try:
+                await rz.read_into("entry.bin", destination)
+            finally:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        assert bytes(destination.data) == content
+        first_write = order.index("write")
+        assert "observer" in order[first_write:]
 
     async def test_read_into_closes_stream_on_error(self, large_file_zip: bytes) -> None:
         """Close the response generator when writing fails mid-stream."""

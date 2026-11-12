@@ -28,6 +28,19 @@ class CRCMismatch(ZipwireError):
         super().__init__(f"CRC-32 mismatch: expected {expected:#010x}, got {actual:#010x}")
 
 
+class TruncatedStream(ZipwireError):
+    """A compressed stream ended early or received data past its end."""
+
+
+class SizeMismatch(ZipwireError):
+    """Decompressed size does not match the entry's declared file size."""
+
+    def __init__(self, expected: int, actual: int) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"Size mismatch: expected {expected} bytes, got {actual}")
+
+
 class RangeRequestUnsupported(ZipwireError):
     """The HTTP server does not support range requests."""
 

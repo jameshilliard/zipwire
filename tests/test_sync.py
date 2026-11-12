@@ -7,8 +7,9 @@ import zipfile
 
 import pytest
 
-from tests.conftest import MockSyncReader
+from tests.conftest import MockSyncReader, make_zip
 from zipwire import EOCDInfo, SyncRemoteZip
+from zipwire._constants import STREAM_CHUNK_SIZE
 from zipwire._errors import FileNotFoundInZip, FileTooLarge, RangeRequestUnsupported
 from zipwire._zipinfo import RemoteZipInfo
 
@@ -251,6 +252,24 @@ class TestSyncRemoteZip:
             dest = io.BytesIO()
             rz.read_into("large.bin", dest)
         assert dest.getvalue() == expected
+
+    def test_read_into_bounded_output_chunks(self) -> None:
+        """Decoded output reaches the destination in bounded chunks."""
+        content = b"\0" * (2 * STREAM_CHUNK_SIZE + 123)
+        sizes: list[int] = []
+        output = bytearray()
+
+        class Destination:
+            def write(self, chunk: bytes) -> int:
+                sizes.append(len(chunk))
+                output.extend(chunk)
+                return len(chunk)
+
+        archive_data = make_zip({"entry.bin": content}, compression=zipfile.ZIP_DEFLATED)
+        with SyncRemoteZip(MockSyncReader(archive_data)) as rz:
+            rz.read_into("entry.bin", Destination())
+        assert bytes(output) == content
+        assert max(sizes) <= STREAM_CHUNK_SIZE
 
     def test_read_zstandard(self, zstandard_zip: bytes) -> None:
         reader = MockSyncReader(zstandard_zip)

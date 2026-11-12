@@ -34,7 +34,9 @@ Stream a file to disk
 
 :meth:`~zipwire.SyncRemoteZip.read_into` streams the compressed payload in
 chunks and decompresses on the fly, keeping peak memory low even for large
-entries:
+entries.  Decoded output is passed to the destination in chunks of at most
+2 MiB, so a highly compressible entry cannot inflate into a single large
+allocation:
 
 .. code-block:: python
 

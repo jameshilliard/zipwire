@@ -16,6 +16,8 @@ from zipwire._parser import find_eocd, parse_local_file_header
 from zipwire._zipinfo import RemoteZipInfo
 
 if typing.TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from zipwire._types import SyncReader, Writable
 
 
@@ -148,6 +150,9 @@ class SyncRemoteZip(RemoteZipBase):
             *max_file_size*, but a crafted archive may lie about its
             uncompressed size.  Use :meth:`read_into` for defence in
             depth: it enforces the size limit during decompression.
+            The decompressed size is verified against the declared
+            ``file_size`` and raises :exc:`~zipwire.SizeMismatch` when
+            they differ.
         """
         resolved = self._resolve_entry(name)
         if resolved is None:
@@ -176,10 +181,17 @@ class SyncRemoteZip(RemoteZipBase):
         Unlike :meth:`read`, this truly streams: the compressed payload is
         fetched in chunks via :meth:`stream_range` and each chunk is
         decompressed and written immediately, keeping peak memory low.
+        Decompressed output is handed to *dest* in chunks of at most
+        2 MiB, even when the entry expands far beyond its compressed size.
 
         The streaming decompressor also enforces *max_file_size* during
         decompression, aborting if the actual output exceeds the limit
-        regardless of what the entry metadata claims.
+        regardless of what the entry metadata claims.  A compressed
+        stream that ends prematurely raises
+        :exc:`~zipwire.TruncatedStream`.  Decompressed output beyond the
+        declared ``file_size`` aborts the transfer and raises
+        :exc:`~zipwire.SizeMismatch`; a shortfall is detected once the
+        stream ends.
 
         Args:
             name: Filename string or RemoteZipInfo object.
@@ -200,13 +212,14 @@ class SyncRemoteZip(RemoteZipBase):
             info.CRC,
             filename=info.filename,
             max_output_size=max_file_size,
+            expected_size=info.file_size,
         )
         if prefetched is not None:
-            if output := sd.feed(prefetched):
-                dest.write(output)
+            encoded: Iterable[bytes] = (prefetched,)
         else:
-            for chunk in self._reader.stream_range(data_offset, info.compress_size):
-                if output := sd.feed(chunk):
+            encoded = self._reader.stream_range(data_offset, info.compress_size)
+        for chunk in encoded:
+            for output in sd.feed_chunks(chunk):
+                if output:
                     dest.write(output)
-        if output := sd.finish():
-            dest.write(output)
+        sd.finish()

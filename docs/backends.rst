@@ -152,7 +152,7 @@ protocol and pass an instance to :class:`~zipwire.SyncRemoteZip` or
 
 .. code-block:: python
 
-   from collections.abc import Iterator
+   from collections.abc import Generator
 
    from zipwire import Headers, SyncReader, SyncRemoteZip
 
@@ -173,7 +173,9 @@ protocol and pass an instance to :class:`~zipwire.SyncRemoteZip` or
        ) -> tuple[bytes, Headers]:
            ...  # GET with Range header, return (data, response_headers)
 
-       def stream_range(self, offset: int, length: int) -> Iterator[bytes]:
+       def stream_range(
+           self, offset: int, length: int
+       ) -> Generator[bytes, None, None]:
            ...  # GET with Range header, yield chunks
 
        def close(self) -> None:
@@ -188,6 +190,15 @@ An asynchronous reader's ``stream_range()`` must return an async generator.
 Zipwire closes it with :func:`contextlib.aclosing` when extraction finishes,
 fails, or is cancelled, so a custom backend can release its HTTP response in
 a ``finally`` block or an async context manager.
+
+A synchronous reader's ``stream_range()`` must return a generator.  Zipwire
+closes it with :func:`contextlib.closing` when extraction finishes, fails,
+or stops early, so a custom backend can release its HTTP response in a
+``finally`` block.  If closing raises, the close error may mask the error
+that aborted extraction; the original remains in the ``__context__`` chain.
+
+The archive and its reader are also closed when the context manager fails to
+load the archive, so no connection or file handle is left behind.
 
 Why only absolute byte ranges?
 -------------------------------

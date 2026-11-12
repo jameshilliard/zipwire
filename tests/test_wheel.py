@@ -9,6 +9,7 @@ import pytest
 
 from tests.conftest import MockAsyncReader, MockSyncReader
 from zipwire import AsyncRemoteWheel, SyncRemoteWheel
+from zipwire._errors import BadZipFile
 from zipwire._wheel import _dist_info_from_url
 
 # ---------------------------------------------------------------------------
@@ -117,6 +118,13 @@ class TestDeriveDistInfoPrefix:
 
 
 class TestSyncRemoteWheel:
+    def test_enter_closes_reader_on_load_failure(self) -> None:
+        url = "https://example.com/example_pkg-1.0.0-py3-none-any.whl"
+        reader = MockSyncReader(b"not a zip file", url=url)
+        with pytest.raises(BadZipFile), SyncRemoteWheel(reader):
+            pass
+        assert reader.closed
+
     def test_basic(self) -> None:
         data, filename = _make_wheel()
         reader = MockSyncReader(data, url=f"https://example.com/{filename}")
@@ -215,6 +223,14 @@ class TestSyncRemoteWheel:
 
 
 class TestAsyncRemoteWheel:
+    async def test_aenter_closes_reader_on_load_failure(self) -> None:
+        url = "https://example.com/example_pkg-1.0.0-py3-none-any.whl"
+        reader = MockAsyncReader(b"not a zip file", url=url)
+        with pytest.raises(BadZipFile):
+            async with AsyncRemoteWheel(reader):
+                pass
+        assert reader.closed
+
     @pytest.mark.asyncio
     async def test_basic(self) -> None:
         data, filename = _make_wheel()

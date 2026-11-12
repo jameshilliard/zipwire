@@ -105,6 +105,12 @@ class _RemoteWheelMixin:
         # the end of multi-GB wheels (e.g. PyTorch, vLLM) is covered.
         return max(_MIN_TAIL_SIZE, file_size // 256)
 
+    def _store_tail(self, tail_start: int, tail: bytes) -> None:
+        # Retain the tail so dist-info entries inside it are served
+        # from the buffer without extra HTTP requests.
+        self._tail_start = tail_start
+        self._tail_data = tail
+
     def _clear(self) -> None:
         super()._clear()  # type: ignore[misc]
         self._tail_start = 0
@@ -167,10 +173,6 @@ class SyncRemoteWheel(_RemoteWheelMixin, SyncRemoteZip):
         super().__init__(reader)
         self._init_wheel(reader.url)
 
-    def __enter__(self) -> SyncRemoteWheel:
-        self._tail_start, self._tail_data = self._ensure_loaded()
-        return self
-
     def _resolve_entry(
         self,
         name: str | RemoteZipInfo,
@@ -204,10 +206,6 @@ class AsyncRemoteWheel(_RemoteWheelMixin, AsyncRemoteZip):
     def __init__(self, reader: AsyncReader) -> None:
         super().__init__(reader)
         self._init_wheel(reader.url)
-
-    async def __aenter__(self) -> AsyncRemoteWheel:
-        self._tail_start, self._tail_data = await self._ensure_loaded()
-        return self
 
     async def _resolve_entry(
         self,

@@ -30,7 +30,7 @@ from urllib.request import url2pathname
 from zipwire._constants import STREAM_CHUNK_SIZE
 
 if typing.TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Iterator
+    from collections.abc import AsyncGenerator, Generator
 
     from zipwire._types import Headers
 
@@ -103,7 +103,7 @@ class FileReader:
         data = fh.read(length)
         return data, _stat_headers(self._file_size())
 
-    def stream_range(self, offset: int, length: int) -> Iterator[bytes]:
+    def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
         fh = self._open()
         fh.seek(offset)
         remaining = length

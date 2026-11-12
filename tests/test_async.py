@@ -11,7 +11,12 @@ import pytest
 from tests.conftest import MockAsyncReader, make_zip
 from zipwire import AsyncRemoteZip, EOCDInfo
 from zipwire._constants import STREAM_CHUNK_SIZE
-from zipwire._errors import FileNotFoundInZip, FileTooLarge, RangeRequestUnsupported
+from zipwire._errors import (
+    BadZipFile,
+    FileNotFoundInZip,
+    FileTooLarge,
+    RangeRequestUnsupported,
+)
 from zipwire._zipinfo import RemoteZipInfo
 
 if typing.TYPE_CHECKING:
@@ -99,6 +104,26 @@ class TestAsyncRemoteZip:
         async with AsyncRemoteZip(reader) as rz:
             rz.namelist()
         assert reader.closed
+
+    async def test_aenter_closes_reader_on_load_failure(self) -> None:
+        reader = MockAsyncReader(b"not a zip file")
+        with pytest.raises(BadZipFile):
+            async with AsyncRemoteZip(reader):
+                pass
+        assert reader.closed
+
+    async def test_aenter_close_error_chains(self) -> None:
+        """A failing reader close() chains the load error as context."""
+
+        class FailingCloseReader(MockAsyncReader):
+            async def close(self) -> None:
+                raise OSError("close failed")
+
+        reader = FailingCloseReader(b"not a zip file")
+        with pytest.raises(OSError, match="close failed") as excinfo:
+            async with AsyncRemoteZip(reader):
+                pass
+        assert isinstance(excinfo.value.__context__, BadZipFile)
 
     async def test_file_size(self, stored_zip: bytes) -> None:
         reader = MockAsyncReader(stored_zip)
@@ -348,6 +373,31 @@ class TestAsyncRemoteZip:
             with pytest.raises(OSError, match="write failed"):
                 await rz.read_into("large.bin", FailingDest())
         assert reader.stream_closed
+
+    async def test_read_into_close_error_chains(self, large_file_zip: bytes) -> None:
+        """A failing stream aclose() masks the extraction error.
+
+        Unlike the sync path, the original error is not reachable in
+        the exception chain here: the async generator machinery drops
+        it when aclose() raises.
+        """
+
+        class FailingCloseReader(MockAsyncReader):
+            async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
+                try:
+                    async for chunk in super().stream_range(offset, length):
+                        yield chunk
+                finally:
+                    raise OSError("close failed")
+
+        class FailingDest:
+            def write(self, data: bytes) -> None:
+                raise OSError("write failed")
+
+        reader = FailingCloseReader(large_file_zip)
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(OSError, match="close failed"):
+                await rz.read_into("large.bin", FailingDest())
 
     async def test_read_zstandard(self, zstandard_zip: bytes) -> None:
         reader = MockAsyncReader(zstandard_zip)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import typing
 
 from zipwire._base import RemoteZipBase
@@ -17,8 +18,6 @@ from zipwire._write import write_all
 from zipwire._zipinfo import RemoteZipInfo
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Iterable
-
     from zipwire._types import SyncReader, Writable
 
 
@@ -40,8 +39,12 @@ class SyncRemoteZip(RemoteZipBase):
         super().__init__()
         self._reader = reader
 
-    def __enter__(self) -> SyncRemoteZip:
-        self._ensure_loaded()
+    def __enter__(self) -> typing.Self:
+        try:
+            self._ensure_loaded()
+        except BaseException:
+            self.close()
+            raise
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -57,12 +60,11 @@ class SyncRemoteZip(RemoteZipBase):
         """The target URL of the underlying reader."""
         return self._reader.url
 
-    def _ensure_loaded(self) -> tuple[int, bytes]:
+    def _ensure_loaded(self) -> None:
         """Fetch and parse the central directory.
 
-        Returns:
-            ``(tail_start, tail_data)`` -- the offset and bytes of the
-            initial tail fetch.
+        Stores the parsed entries via ``_set_entries()`` and the initial
+        tail fetch via ``_store_tail()``.
 
         Raises:
             RuntimeError: If called more than once.
@@ -89,8 +91,7 @@ class SyncRemoteZip(RemoteZipBase):
         # Step 3: Fetch central directory and store parsed state
         cd_data, _ = self._reader.read_range(eocd.cd_offset, eocd.cd_size)
         self._set_entries(cd_data, file_size, eocd)
-
-        return tail_start, tail
+        self._store_tail(tail_start, tail)
 
     def _resolve_entry(
         self,
@@ -204,6 +205,11 @@ class SyncRemoteZip(RemoteZipBase):
         Errors may leave partial output; only a successful return indicates
         that CRC-32 verification passed.
 
+        The streamed response is closed when extraction finishes or fails.
+        If closing the stream raises, the close error propagates and may
+        mask the original exception, which remains available in its
+        ``__context__`` chain.
+
         Args:
             name: Filename string or RemoteZipInfo object.
             dest: A writable file-like object (e.g. ``io.BytesIO``, open file).
@@ -226,9 +232,10 @@ class SyncRemoteZip(RemoteZipBase):
             expected_size=info.file_size,
         )
         if prefetched is not None:
-            encoded: Iterable[bytes] = (prefetched,)
+            write_all(dest, sd.feed_chunks(prefetched))
         else:
-            encoded = self._reader.stream_range(data_offset, info.compress_size)
-        for chunk in encoded:
-            write_all(dest, sd.feed_chunks(chunk))
+            stream = self._reader.stream_range(data_offset, info.compress_size)
+            with contextlib.closing(stream):
+                for chunk in stream:
+                    write_all(dest, sd.feed_chunks(chunk))
         sd.finish()

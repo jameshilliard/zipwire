@@ -23,7 +23,7 @@ from zipwire._constants import STREAM_CHUNK_SIZE, range_header
 from zipwire._errors import RangeRequestUnsupported
 
 if typing.TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Iterator
+    from collections.abc import AsyncGenerator, Generator
 
     from zipwire._types import Headers
 
@@ -79,7 +79,7 @@ class Httpx2SyncReader:
             )
         return resp.content, resp.headers
 
-    def stream_range(self, offset: int, length: int) -> Iterator[bytes]:
+    def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
         logger.debug(
             "GET stream %s %s (%d bytes)", self._url, range_header(offset, length), length
         )

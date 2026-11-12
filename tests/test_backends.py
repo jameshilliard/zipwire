@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from contextlib import closing
 
 import pytest
 import urllib3
@@ -18,6 +19,7 @@ from tests.conftest import (
     needs_requests,
 )
 from zipwire import AsyncReader, AsyncRemoteZip, SyncReader, SyncRemoteZip, backends
+from zipwire._constants import STREAM_CHUNK_SIZE
 from zipwire._errors import RangeRequestUnsupported
 from zipwire.backends import AsyncFileReader, FileReader, Urllib3Reader
 
@@ -242,6 +244,35 @@ class TestHttpx2AsyncBackend:
 
 
 class TestUrllib3Backend:
+    @pytest.mark.parametrize("status", [200, 206, 403])
+    def test_stream_response_cleanup(self, httpserver, monkeypatch, status: int) -> None:
+        data = b"x" * (STREAM_CHUNK_SIZE * 2)
+        httpserver.expect_request("/stream.zip").respond_with_data(data, status=status)
+        url = httpserver.url_for("/stream.zip")
+        with urllib3.PoolManager(maxsize=1, block=True, retries=False, timeout=2) as pool:
+            response = pool.request("GET", url, preload_content=False)
+            assert isinstance(response, urllib3.response.HTTPResponse)
+            connection = response.connection
+            assert connection is not None
+
+            def request(*args: object, **kwargs: object) -> urllib3.response.HTTPResponse:
+                return response
+
+            with closing(response), monkeypatch.context() as patch:
+                patch.setattr(pool, "request", request)
+                reader = Urllib3Reader(url, pool=pool)
+                with closing(reader.stream_range(0, len(data))) as stream:
+                    if status == 206:
+                        assert next(stream) == data[:STREAM_CHUNK_SIZE]
+                    else:
+                        error = OSError if status >= 400 else RangeRequestUnsupported
+                        with pytest.raises(error):
+                            next(stream)
+                assert response.closed
+                assert connection.is_closed
+            # The external pool must have its slot back after early termination.
+            assert pool.request("GET", url, pool_timeout=2).data == data
+
     def test_read_file(self, zip_server) -> None:
         url = zip_server.url_for("/test.zip")
         reader = Urllib3Reader(url)
@@ -326,6 +357,17 @@ class TestUrllib3Backend:
 
 @needs_requests
 class TestRequestsBackend:
+    def test_stream_http_error_closes_response(self, httpserver) -> None:
+        httpserver.expect_request("/error.zip").respond_with_data("forbidden", status=403)
+        url = httpserver.url_for("/error.zip")
+        with requests.Session() as session:
+            reader = RequestsReader(url, session=session)
+            with pytest.raises(requests.HTTPError) as error:
+                next(reader.stream_range(0, 10))
+            response = error.value.response
+            assert response is not None
+            assert response.raw.closed
+
     def test_read_file(self, zip_server) -> None:
         url = zip_server.url_for("/test.zip")
         reader = RequestsReader(url)

@@ -41,8 +41,12 @@ class AsyncRemoteZip(RemoteZipBase):
         super().__init__()
         self._reader = reader
 
-    async def __aenter__(self) -> AsyncRemoteZip:
-        await self._ensure_loaded()
+    async def __aenter__(self) -> typing.Self:
+        try:
+            await self._ensure_loaded()
+        except BaseException:
+            await self.close()
+            raise
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -58,12 +62,11 @@ class AsyncRemoteZip(RemoteZipBase):
         """The target URL of the underlying reader."""
         return self._reader.url
 
-    async def _ensure_loaded(self) -> tuple[int, bytes]:
+    async def _ensure_loaded(self) -> None:
         """Fetch and parse the central directory.
 
-        Returns:
-            ``(tail_start, tail_data)`` -- the offset and bytes of the
-            initial tail fetch.
+        Stores the parsed entries via ``_set_entries()`` and the initial
+        tail fetch via ``_store_tail()``.
 
         Raises:
             RuntimeError: If called more than once.
@@ -90,8 +93,7 @@ class AsyncRemoteZip(RemoteZipBase):
         # Step 3: Fetch central directory and store parsed state
         cd_data, _ = await self._reader.read_range(eocd.cd_offset, eocd.cd_size)
         self._set_entries(cd_data, file_size, eocd)
-
-        return tail_start, tail
+        self._store_tail(tail_start, tail)
 
     async def _resolve_entry(
         self,
@@ -196,7 +198,8 @@ class AsyncRemoteZip(RemoteZipBase):
         stream ends.
 
         The streamed response is closed when extraction finishes, fails,
-        or is cancelled.
+        or is cancelled.  If closing the stream raises, the close error
+        propagates and may mask the original exception.
 
         If ``dest.write()`` returns an awaitable, it is awaited before the
         next chunk is read or decompressed, so a slow destination applies

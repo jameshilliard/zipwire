@@ -5,7 +5,7 @@ from __future__ import annotations
 import typing
 
 if typing.TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Iterator
+    from collections.abc import AsyncGenerator, Generator
 
 
 @typing.runtime_checkable
@@ -59,8 +59,19 @@ class SyncReader(typing.Protocol):
         """
         ...
 
-    def stream_range(self, offset: int, length: int) -> Iterator[bytes]:
-        """Stream *length* bytes starting at *offset* as chunks."""
+    def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
+        """Stream *length* bytes starting at *offset* as chunks.
+
+        Must return a generator.  Zipwire closes it with
+        :func:`contextlib.closing` when extraction stops early, so the
+        underlying response is released promptly.
+
+        .. versionchanged:: 0.5.0
+
+           The return type changed from ``Iterator[bytes]`` to
+           ``Generator[bytes, None, None]``.  Custom sync backends must
+           return a generator so zipwire can close it.
+        """
         ...
 
     def close(self) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import typing
 
@@ -11,7 +12,7 @@ from zipwire._constants import STREAM_CHUNK_SIZE, range_header
 from zipwire._errors import RangeRequestUnsupported
 
 if typing.TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
     from zipwire._types import Headers
 
@@ -69,7 +70,7 @@ class Urllib3Reader:
             )
         return bytes(resp.data), resp.headers
 
-    def stream_range(self, offset: int, length: int) -> Iterator[bytes]:
+    def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
         logger.debug(
             "GET stream %s %s (%d bytes)", self._url, range_header(offset, length), length
         )
@@ -80,17 +81,21 @@ class Urllib3Reader:
             preload_content=False,
             redirect=self._allow_redirects,
         )
-        if resp.status >= 400:
-            resp.release_conn()
-            raise OSError(f"Range request failed with status {resp.status}")
-        if resp.status != 206:
-            resp.release_conn()
-            raise RangeRequestUnsupported(
-                f"Server does not support range requests for {self._url}"
-            )
         try:
-            yield from resp.stream(STREAM_CHUNK_SIZE)
+            with contextlib.closing(resp):
+                if resp.status >= 400:
+                    raise OSError(f"Range request failed with status {resp.status}")
+                if resp.status != 206:
+                    raise RangeRequestUnsupported(
+                        f"Server does not support range requests for {self._url}"
+                    )
+                yield from resp.stream(STREAM_CHUNK_SIZE)
         finally:
+            # release_conn() frees the pool slot even when the body was
+            # not fully consumed.  resp.close() has already closed the
+            # connection, so the pool discards it at checkout; without
+            # this call the slot would stay occupied and a full blocking
+            # pool could hang or raise EmptyPoolError.
             resp.release_conn()
 
     def close(self) -> None:

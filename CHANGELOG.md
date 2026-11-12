@@ -17,12 +17,11 @@ releases; they are marked **BREAKING**.
 
 ### Changed
 
-- **BREAKING:** `AsyncReader.stream_range()` now returns
-  `AsyncGenerator[bytes, None]` instead of `AsyncIterator[bytes]`. Custom
-  async backends must return an async generator so zipwire can close it.
-- `AsyncRemoteZip` now closes the streamed response deterministically when
-  extraction finishes, fails, or is cancelled, instead of relying on async
-  generator finalization.
+- **BREAKING:** `SyncReader.stream_range()` and `AsyncReader.stream_range()`
+  now return `Generator[bytes, None]` and `AsyncGenerator[bytes, None]`
+  instead of `Iterator[bytes]` and `AsyncIterator[bytes]`. Custom backends
+  must return generators so zipwire can close them when extraction stops
+  early.
 - **BREAKING:** `read_into()` now retries partial writes and validates
   what `write()` reports: a zero, negative, oversized, or non-integer
   byte count raises `OSError`. `Writable.write()` and
@@ -30,6 +29,13 @@ releases; they are marked **BREAKING**.
   `None` to mean that the whole chunk was written. Destinations that
   return any other value, such as `True` as a success flag, now fail;
   they must be updated to return a byte count or `None`.
+
+### Fixed
+
+- Streamed HTTP responses and their pooled connections are now closed
+  deterministically when a range request fails or extraction stops early,
+  rather than waiting for generator finalization, and the reader is closed
+  when the archive context manager fails to load.
 
 ### Security
 

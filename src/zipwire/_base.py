@@ -71,6 +71,14 @@ class RemoteZipBase:
         """
         return MAX_EOCD_SEARCH
 
+    def _store_tail(self, tail_start: int, tail: bytes) -> None:
+        """Retain the initial tail fetch.
+
+        Called at the end of a successful load.  The default discards
+        the tail; subclasses may override this to serve entries from
+        the buffer.
+        """
+
     def infolist(self) -> list[RemoteZipInfo]:
         """Return a list of RemoteZipInfo objects for all files in the archive."""
         if self._entries is None:

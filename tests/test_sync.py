@@ -11,8 +11,16 @@ import pytest
 from tests.conftest import MockSyncReader, make_zip
 from zipwire import EOCDInfo, SyncRemoteZip
 from zipwire._constants import STREAM_CHUNK_SIZE
-from zipwire._errors import FileNotFoundInZip, FileTooLarge, RangeRequestUnsupported
+from zipwire._errors import (
+    BadZipFile,
+    FileNotFoundInZip,
+    FileTooLarge,
+    RangeRequestUnsupported,
+)
 from zipwire._zipinfo import RemoteZipInfo
+
+if typing.TYPE_CHECKING:
+    from collections.abc import Generator
 
 
 class TestSyncRemoteZip:
@@ -115,6 +123,24 @@ class TestSyncRemoteZip:
         with SyncRemoteZip(reader) as rz:
             rz.namelist()
         assert reader.closed
+
+    def test_enter_closes_reader_on_load_failure(self) -> None:
+        reader = MockSyncReader(b"not a zip file")
+        with pytest.raises(BadZipFile), SyncRemoteZip(reader):
+            pass
+        assert reader.closed
+
+    def test_enter_close_error_chains(self) -> None:
+        """A failing reader close() chains the load error as context."""
+
+        class FailingCloseReader(MockSyncReader):
+            def close(self) -> None:
+                raise OSError("close failed")
+
+        reader = FailingCloseReader(b"not a zip file")
+        with pytest.raises(OSError, match="close failed") as excinfo, SyncRemoteZip(reader):
+            pass
+        assert isinstance(excinfo.value.__context__, BadZipFile)
 
     def test_loading_on_enter(self, stored_zip: bytes) -> None:
         reader = MockSyncReader(stored_zip)
@@ -311,6 +337,51 @@ class TestSyncRemoteZip:
         reader = MockSyncReader(make_zip({"entry.bin": b"x" * size}))
         with SyncRemoteZip(reader) as rz, pytest.raises(OSError, match="invalid byte count"):
             rz.read_into("entry.bin", Destination())
+
+    def test_read_into_closes_stream_on_error(self, large_file_zip: bytes) -> None:
+        """Close the response generator when writing fails mid-stream."""
+
+        class ClosingReader(MockSyncReader):
+            stream_closed = False
+
+            def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
+                try:
+                    yield from super().stream_range(offset, length)
+                finally:
+                    self.stream_closed = True
+
+        class FailingDest:
+            def write(self, data: bytes) -> None:
+                raise OSError("write failed")
+
+        reader = ClosingReader(large_file_zip)
+        with SyncRemoteZip(reader) as rz, pytest.raises(OSError, match="write failed"):
+            rz.read_into("large.bin", FailingDest())
+        assert reader.stream_closed
+
+    def test_read_into_close_error_chains(self, large_file_zip: bytes) -> None:
+        """A failing stream close() chains the extraction error as context."""
+
+        class FailingCloseReader(MockSyncReader):
+            def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
+                try:
+                    yield from super().stream_range(offset, length)
+                finally:
+                    raise OSError("close failed")
+
+        class FailingDest:
+            def write(self, data: bytes) -> None:
+                raise OSError("write failed")
+
+        reader = FailingCloseReader(large_file_zip)
+        with SyncRemoteZip(reader) as rz, pytest.raises(OSError, match="close failed") as excinfo:
+            rz.read_into("large.bin", FailingDest())
+        # The original error is chained behind the GeneratorExit that
+        # close() threw into the generator.
+        context = excinfo.value.__context__
+        while context is not None and "write failed" not in str(context):
+            context = context.__context__
+        assert "write failed" in str(context)
 
     def test_read_zstandard(self, zstandard_zip: bytes) -> None:
         reader = MockSyncReader(zstandard_zip)

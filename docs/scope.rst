@@ -8,8 +8,11 @@ whole file.
 The scope is deliberately small.  zipwire would rather do one thing well than
 grow into a general-purpose archive toolkit: keeping the feature set focused
 makes the package easier to maintain and keeps feature creep out of the common
-wheel-reading path.  This page describes what is in scope and what is
-deliberately left out.
+wheel-reading path.  **It is not a drop-in replacement for the standard
+library's :mod:`zipfile` module**: it targets modern ZIP files written by
+current mainstream tools and package builders, and may not handle unusual,
+ambiguous, or legacy archive structures.  This page describes what is in scope
+and what is deliberately left out.
 
 In scope
 --------
@@ -40,6 +43,13 @@ Local archives are supported through
 
 Out of scope
 ------------
+
+Full ``zipfile`` compatibility
+   zipwire is not designed as a replacement for :mod:`zipfile`.  It reads
+   modern archives produced by current mainstream tools and package
+   builders, and makes no promise of matching :mod:`zipfile` for malformed,
+   ambiguous, or legacy archives.  Code that needs a general-purpose reader
+   for arbitrary local archives should use :mod:`zipfile`.
 
 Other transports (S3, FTP, ...)
    zipwire reads over HTTP(S) range requests and plain file IO.  Other

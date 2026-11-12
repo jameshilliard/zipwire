@@ -24,6 +24,14 @@ CENTRAL_DIR_SIZE = 46  # zipfile.sizeCentralDir
 LOCAL_FILE_HEADER_SIZE = 30  # zipfile.sizeFileHeader
 
 # ---------------------------------------------------------------------------
+# General purpose bit flags (APPNOTE 4.4.4)
+# ---------------------------------------------------------------------------
+FLAG_ENCRYPTED = 1 << 0  # zipfile._MASK_ENCRYPTED
+FLAG_COMPRESSED_PATCHED_DATA = 1 << 5  # zipfile._MASK_COMPRESSED_PATCH
+FLAG_STRONG_ENCRYPTION = 1 << 6  # zipfile._MASK_STRONG_ENCRYPTION
+FLAG_UTF8_FILENAME = 1 << 11  # zipfile._MASK_UTF_FILENAME
+
+# ---------------------------------------------------------------------------
 # Compression methods
 # ---------------------------------------------------------------------------
 

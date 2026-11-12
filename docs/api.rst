@@ -97,6 +97,7 @@ Exceptions
    Exception
    └── ZipwireError
        ├── BadZipFile
+       ├── UnsupportedFeature
        ├── UnsupportedCompression
        ├── CRCMismatch
        ├── SizeMismatch
@@ -109,6 +110,9 @@ Exceptions
    :show-inheritance:
 
 .. autoexception:: zipwire.BadZipFile
+   :show-inheritance:
+
+.. autoexception:: zipwire.UnsupportedFeature
    :show-inheritance:
 
 .. autoexception:: zipwire.UnsupportedCompression

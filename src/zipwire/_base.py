@@ -2,8 +2,22 @@
 
 from __future__ import annotations
 
-from zipwire._constants import MAX_EOCD_SEARCH
-from zipwire._errors import FileNotFoundInZip
+import os
+import sys
+import warnings
+
+from zipwire._constants import (
+    FLAG_COMPRESSED_PATCHED_DATA,
+    FLAG_ENCRYPTED,
+    FLAG_STRONG_ENCRYPTION,
+    LOCAL_FILE_HEADER_SIZE,
+    MAX_EOCD_SEARCH,
+)
+from zipwire._errors import (
+    BadZipFile,
+    FileNotFoundInZip,
+    UnsupportedFeature,
+)
 from zipwire._parser import EOCDInfo, parse_central_directory
 from zipwire._zipinfo import RemoteZipInfo
 
@@ -31,19 +45,118 @@ class RemoteZipBase:
         self._file_size = None
         self._eocd = None
 
+    def _validate_cd_bounds(self, file_size: int, eocd: EOCDInfo) -> None:
+        """Check that the central directory lies inside the archive.
+
+        This runs before the central directory is fetched, so a hostile
+        end record cannot make zipwire request an arbitrary range.
+
+        Raises:
+            BadZipFile: If the central directory extends beyond the end
+                of the archive.
+        """
+        if eocd.cd_offset + eocd.cd_size > file_size:
+            raise BadZipFile(
+                f"Central directory ({eocd.cd_offset} + {eocd.cd_size} bytes) "
+                f"extends beyond the end of the archive ({file_size} bytes)"
+            )
+
     def _set_entries(
         self,
         cd_data: bytes,
         file_size: int,
         eocd: EOCDInfo,
     ) -> None:
-        """Parse central directory data and store entries."""
+        """Parse central directory data and store entries.
+
+        Raises:
+            BadZipFile: If the central directory lies beyond the end of
+                the archive or the fetch returned the wrong number of
+                bytes.
+        """
+        self._validate_cd_bounds(file_size, eocd)
+        if len(cd_data) != eocd.cd_size:
+            raise BadZipFile(
+                f"Central directory fetch returned {len(cd_data)} of {eocd.cd_size} bytes"
+            )
         raw_entries = parse_central_directory(cd_data, eocd.cd_entry_count)
         entries = [RemoteZipInfo._from_central_dir_entry(e) for e in raw_entries]
+        # Record where each entry's data region ends: the start of the
+        # next entry's local header, or the central directory for the
+        # entry closest to it.  Like zipfile, this is used to detect
+        # overlapped entries when reading.
+        end_offset = eocd.cd_offset
+        for info in sorted(entries, key=lambda i: i.header_offset, reverse=True):
+            info._end_offset = end_offset
+            end_offset = info.header_offset
         self._entries = entries
         self._name_index = {info.filename: info for info in entries}
         self._file_size = file_size
         self._eocd = eocd
+
+    def _validate_entry(self, info: RemoteZipInfo) -> None:
+        """Reject entries that zipwire cannot read.
+
+        Checks the general purpose flags for features zipwire does not
+        support and that the local file header lies within the archive.
+
+        Raises:
+            UnsupportedFeature: If the entry is encrypted (flag bit 0),
+                uses strong encryption (flag bit 6), or compressed
+                patched data (flag bit 5).
+            BadZipFile: If the local file header offset lies beyond the
+                end of the archive.
+        """
+        flags = info.flag_bits
+        if flags & FLAG_STRONG_ENCRYPTION:
+            raise UnsupportedFeature(
+                f"{info.filename!r}: strong encryption (general purpose flag bit 6)"
+            )
+        if flags & FLAG_COMPRESSED_PATCHED_DATA:
+            raise UnsupportedFeature(
+                f"{info.filename!r}: compressed patched data (general purpose flag bit 5)"
+            )
+        if flags & FLAG_ENCRYPTED:
+            raise UnsupportedFeature(f"{info.filename!r} is encrypted")
+        if info.header_offset + LOCAL_FILE_HEADER_SIZE > self.file_size:
+            raise BadZipFile(
+                f"{info.filename!r}: local file header at offset {info.header_offset} "
+                "is beyond the end of the archive"
+            )
+
+    def _validate_data_region(self, info: RemoteZipInfo, data_offset: int) -> None:
+        """Check that an entry's compressed data stays inside its region.
+
+        The data must end within the archive and before the next entry's
+        local header (or the central directory), so a hostile central
+        directory cannot make zipwire fetch another entry's data or the
+        directory itself as file data.
+
+        Raises:
+            BadZipFile: If the data extends beyond the archive or
+                overlaps the next entry (possible zip bomb).
+        """
+        data_end = data_offset + info.compress_size
+        if data_end > self.file_size:
+            raise BadZipFile(
+                f"{info.filename!r}: compressed data extends beyond the end of the archive"
+            )
+        end_offset = info._end_offset
+        if end_offset is not None and data_end > end_offset:
+            if end_offset == info.header_offset:
+                # Two entries share the same local header; zipfile warns
+                # instead of raising for this case.
+                message = f"Overlapped entries: {info.filename!r} (possible zip bomb)"
+                if sys.version_info >= (3, 12):
+                    # Attribute the warning to the caller regardless of
+                    # how many frames zipwire adds below it.
+                    warnings.warn(message, skip_file_prefixes=(os.path.dirname(__file__),))
+                else:
+                    # Points at the caller of read()/read_into(); the
+                    # wheel tail path adds one frame.
+                    warnings.warn(message, stacklevel=4)
+            else:
+                raise BadZipFile(f"Overlapped entries: {info.filename!r} (possible zip bomb)")
 
     @property
     def file_size(self) -> int:

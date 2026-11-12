@@ -22,6 +22,61 @@ from zipwire._parser import (
 )
 
 
+def _make_zip64_tail(
+    *,
+    cd_size: int = 1000,
+    cd_entry_count: int = 5,
+    record_size: int = 44,
+    locator_disk: int = 0,
+    total_disks: int = 1,
+    cd_gap: int = 0,
+) -> tuple[bytes, int]:
+    """Build a ``(tail, file_size)`` pair with ZIP64 EOCD + locator + EOCD.
+
+    The central directory ends exactly where the ZIP64 EOCD record begins,
+    unless *cd_gap* shifts its start further back.
+    """
+    file_size = 5000
+    tail_start = file_size - (56 + 20 + 22)  # record + locator + eocd
+    cd_offset = tail_start - cd_size - cd_gap
+
+    # ZIP64 EOCD Record (56 bytes)
+    zip64_eocd = ZIP64_EOCD_STRUCT.pack(
+        b"PK\x06\x06",  # signature
+        record_size,  # record size (remaining bytes after this field)
+        45,  # version made by
+        45,  # version needed
+        0,  # disk number
+        0,  # disk with CD start
+        cd_entry_count,  # entries this disk
+        cd_entry_count,  # entries total
+        cd_size,  # CD size
+        cd_offset,  # CD offset
+    )
+
+    # ZIP64 EOCD Locator (20 bytes)
+    locator = ZIP64_EOCD_LOCATOR_STRUCT.pack(
+        b"PK\x06\x07",  # signature
+        locator_disk,  # disk with ZIP64 EOCD
+        tail_start,  # absolute offset of ZIP64 EOCD
+        total_disks,  # total disks
+    )
+
+    # Regular EOCD with sentinel values (22 bytes)
+    eocd = EOCD_STRUCT.pack(
+        b"PK\x05\x06",
+        0,  # disk number
+        0,  # disk with CD start
+        0xFFFF,  # entries this disk (sentinel)
+        0xFFFF,  # entries total (sentinel)
+        0xFFFFFFFF,  # CD size (sentinel)
+        0xFFFFFFFF,  # CD offset (sentinel)
+        0,  # comment length
+    )
+
+    return zip64_eocd + locator + eocd, file_size
+
+
 class TestFindEocd:
     def test_simple_zip(self, stored_zip: bytes) -> None:
         tail = stored_zip
@@ -49,58 +104,74 @@ class TestFindEocd:
         with pytest.raises(BadZipFile, match="truncated"):
             find_eocd(data, len(data))
 
+    def test_multi_disk_eocd_rejected(self) -> None:
+        """EOCD claiming a non-zero disk number is a spanning archive."""
+        eocd = EOCD_STRUCT.pack(b"PK\x05\x06", 1, 0, 0, 0, 0, 0, 0)
+        with pytest.raises(BadZipFile, match="multiple disks"):
+            find_eocd(eocd, len(eocd))
+
+    def test_multi_disk_cd_start_rejected(self) -> None:
+        """EOCD claiming a non-zero CD start disk is a spanning archive."""
+        eocd = EOCD_STRUCT.pack(b"PK\x05\x06", 0, 1, 0, 0, 0, 0, 0)
+        with pytest.raises(BadZipFile, match="multiple disks"):
+            find_eocd(eocd, len(eocd))
+
     def test_zip64_eocd(self) -> None:
         """Construct a tail with ZIP64 EOCD Record + Locator + EOCD."""
-        cd_entry_count = 5
-        cd_size = 1000
-        cd_offset = 2000
-
-        # ZIP64 EOCD Record (56 bytes)
-        zip64_eocd = ZIP64_EOCD_STRUCT.pack(
-            b"PK\x06\x06",  # signature
-            44,  # record size (remaining bytes after this field)
-            45,  # version made by
-            45,  # version needed
-            0,  # disk number
-            0,  # disk with CD start
-            cd_entry_count,  # entries this disk
-            cd_entry_count,  # entries total
-            cd_size,  # CD size
-            cd_offset,  # CD offset
-        )
-
-        # The ZIP64 EOCD record is at the beginning of our tail
-        # Its absolute offset in the file = tail_start + 0
-        file_size = 5000
-        tail_start = file_size - (len(zip64_eocd) + 20 + 22)  # zip64_eocd + locator + eocd
-        zip64_eocd_abs_offset = tail_start
-
-        # ZIP64 EOCD Locator (20 bytes)
-        locator = ZIP64_EOCD_LOCATOR_STRUCT.pack(
-            b"PK\x06\x07",  # signature
-            0,  # disk with ZIP64 EOCD
-            zip64_eocd_abs_offset,  # absolute offset of ZIP64 EOCD
-            1,  # total disks
-        )
-
-        # Regular EOCD with sentinel values (22 bytes)
-        eocd = EOCD_STRUCT.pack(
-            b"PK\x05\x06",
-            0,  # disk number
-            0,  # disk with CD start
-            0xFFFF,  # entries this disk (sentinel)
-            0xFFFF,  # entries total (sentinel)
-            0xFFFFFFFF,  # CD size (sentinel)
-            0xFFFFFFFF,  # CD offset (sentinel)
-            0,  # comment length
-        )
-
-        tail = zip64_eocd + locator + eocd
+        tail, file_size = _make_zip64_tail()
         result = find_eocd(tail, file_size)
         assert isinstance(result, EOCDInfo)
-        assert result.cd_entry_count == cd_entry_count
-        assert result.cd_size == cd_size
-        assert result.cd_offset == cd_offset
+        assert result.cd_entry_count == 5
+        assert result.cd_size == 1000
+        assert result.cd_offset == file_size - 98 - 1000
+
+    def test_zip64_locator_multiple_disks(self) -> None:
+        """Locator claiming the ZIP64 EOCD is on another disk."""
+        tail, file_size = _make_zip64_tail(locator_disk=1)
+        with pytest.raises(BadZipFile, match="multiple disks"):
+            find_eocd(tail, file_size)
+
+    def test_zip64_total_disks(self) -> None:
+        """Locator claiming more than one disk."""
+        tail, file_size = _make_zip64_tail(total_disks=2)
+        with pytest.raises(BadZipFile, match="multiple disks"):
+            find_eocd(tail, file_size)
+
+    def test_zip64_record_size_mismatch(self) -> None:
+        """Record size field does not match the space before the locator."""
+        tail, file_size = _make_zip64_tail(record_size=45)
+        with pytest.raises(BadZipFile, match="Corrupt zip64 end of central directory record"):
+            find_eocd(tail, file_size)
+
+    def test_zip64_cd_gap_before_record(self) -> None:
+        """Central directory does not end where the ZIP64 EOCD record begins."""
+        tail, file_size = _make_zip64_tail(cd_gap=10)
+        with pytest.raises(BadZipFile, match="Corrupt zip64 end of central directory record"):
+            find_eocd(tail, file_size)
+
+    def test_zip64_record_after_locator(self) -> None:
+        """Locator points at a record that would start after the locator."""
+        file_size = 5000
+        tail_start = file_size - (56 + 20 + 22)
+        locator = ZIP64_EOCD_LOCATOR_STRUCT.pack(
+            b"PK\x06\x07",
+            0,
+            tail_start + 60,  # record would overlap the locator and EOCD
+            1,
+        )
+        eocd = EOCD_STRUCT.pack(
+            b"PK\x05\x06",
+            0,
+            0,
+            0xFFFF,
+            0xFFFF,
+            0xFFFFFFFF,
+            0xFFFFFFFF,
+            0,
+        )
+        tail = b"\x00" * 56 + locator + eocd
+        with pytest.raises(BadZipFile, match="Corrupt zip64 end of central directory locator"):
+            find_eocd(tail, file_size)
 
     def test_zip64_locator_not_found(self) -> None:
         """Not enough data before EOCD for the locator."""

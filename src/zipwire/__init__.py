@@ -118,6 +118,7 @@ from zipwire._errors import (
     SizeMismatch,
     TruncatedStream,
     UnsupportedCompression,
+    UnsupportedFeature,
     ZipwireError,
 )
 from zipwire._parser import EOCDInfo
@@ -146,6 +147,7 @@ __all__ = [
     "SyncRemoteZip",
     "TruncatedStream",
     "UnsupportedCompression",
+    "UnsupportedFeature",
     "Writable",
     "ZipwireError",
 ]

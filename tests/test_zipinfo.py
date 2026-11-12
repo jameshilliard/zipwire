@@ -6,7 +6,10 @@ import io
 import struct
 import zipfile
 
+import pytest
+
 from zipwire._constants import ZIP64_EXTRA_FIELD_ID
+from zipwire._errors import BadZipFile
 from zipwire._parser import find_eocd, parse_central_directory
 from zipwire._zipinfo import RemoteZipInfo, _apply_zip64_extra
 
@@ -168,3 +171,51 @@ class TestZip64ExtraField:
         _apply_zip64_extra(info)
         assert info.file_size == real_file_size
         assert info.compress_size == 500  # unchanged (not sentinel)
+
+    def test_zip64_field_too_short(self) -> None:
+        """Sentinel file_size promises a ZIP64 value that is not there."""
+        info = RemoteZipInfo("test.txt")
+        info.file_size = 0xFFFFFFFF
+        info.compress_size = 100
+        info.header_offset = 5
+        info.volume = 0
+        # ZIP64 extra field with only 4 bytes of data
+        info.extra = struct.pack("<HH", ZIP64_EXTRA_FIELD_ID, 4) + b"\x00" * 4
+
+        with pytest.raises(BadZipFile, match="File size not found"):
+            _apply_zip64_extra(info)
+
+    def test_zip64_second_field_missing(self) -> None:
+        """Both sizes are sentinels but only one ZIP64 value is present."""
+        info = RemoteZipInfo("test.txt")
+        info.file_size = 0xFFFFFFFF
+        info.compress_size = 0xFFFFFFFF
+        info.header_offset = 5
+        info.volume = 0
+        zip64_data = struct.pack("<Q", 0x1_0000_0000)
+        info.extra = struct.pack("<HH", ZIP64_EXTRA_FIELD_ID, len(zip64_data)) + zip64_data
+
+        with pytest.raises(BadZipFile, match="Compress size not found"):
+            _apply_zip64_extra(info)
+
+    def test_zip64_disk_start_missing(self) -> None:
+        """Volume sentinel promises a disk start number that is not there."""
+        info = RemoteZipInfo("test.txt")
+        info.file_size = 10
+        info.compress_size = 10
+        info.header_offset = 5
+        info.volume = 0xFFFF
+        # ZIP64 extra field with no data at all
+        info.extra = struct.pack("<HH", ZIP64_EXTRA_FIELD_ID, 0)
+
+        with pytest.raises(BadZipFile, match="Disk start number not found"):
+            _apply_zip64_extra(info)
+
+    def test_truncated_extra_field(self) -> None:
+        """Extra field header claims more data than is present."""
+        info = RemoteZipInfo("test.txt")
+        # Field 0x000a claims 16 bytes of data but only 4 follow
+        info.extra = struct.pack("<HH", 0x000A, 16) + b"\x00" * 4
+
+        with pytest.raises(BadZipFile, match="Corrupt extra field"):
+            _apply_zip64_extra(info)

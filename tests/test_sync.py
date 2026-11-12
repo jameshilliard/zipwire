@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import struct
 import typing
 import zipfile
 
@@ -10,13 +11,21 @@ import pytest
 
 from tests.conftest import MockSyncReader, make_zip
 from zipwire import EOCDInfo, SyncRemoteZip
-from zipwire._constants import STREAM_CHUNK_SIZE
+from zipwire._constants import (
+    CENTRAL_DIR_SIZE,
+    FLAG_COMPRESSED_PATCHED_DATA,
+    FLAG_ENCRYPTED,
+    FLAG_STRONG_ENCRYPTION,
+    STREAM_CHUNK_SIZE,
+)
 from zipwire._errors import (
     BadZipFile,
     FileNotFoundInZip,
     FileTooLarge,
     RangeRequestUnsupported,
+    UnsupportedFeature,
 )
+from zipwire._parser import find_eocd
 from zipwire._zipinfo import RemoteZipInfo
 
 if typing.TYPE_CHECKING:
@@ -413,4 +422,195 @@ class TestSyncRemoteZip:
         reader = MockSyncReader(stored_zip)
         reader.head = lambda: {"accept-ranges": "bytes"}
         with pytest.raises(RangeRequestUnsupported, match="Content-Length"), SyncRemoteZip(reader):
+            pass
+
+
+def _cd_entry_offset(data: bytes, index: int = 0) -> int:
+    """Absolute offset of central directory entry *index* in *data*."""
+    eocd = find_eocd(data, len(data))
+    offset = eocd.cd_offset
+    for _ in range(index):
+        fn_len, extra_len, comment_len = struct.unpack_from("<HHH", data, offset + 28)
+        offset += CENTRAL_DIR_SIZE + fn_len + extra_len + comment_len
+    return offset
+
+
+def _or_cd_flags(data: bytes, mask: int, index: int = 0) -> bytes:
+    """Set general purpose flag bits in central directory entry *index*."""
+    buf = bytearray(data)
+    offset = _cd_entry_offset(data, index)
+    flags = struct.unpack_from("<H", buf, offset + 8)[0]
+    struct.pack_into("<H", buf, offset + 8, flags | mask)
+    return bytes(buf)
+
+
+class ShortTailReader(MockSyncReader):
+    """Reader whose first (tail) read_range returns one byte too few."""
+
+    def read_range(
+        self,
+        offset: int,
+        length: int,
+    ) -> tuple[bytes, dict[str, str]]:
+        data, headers = super().read_range(offset, length)
+        if self.read_count == 1:
+            data = data[:-1]
+        return data, headers
+
+
+class ShortCdReader(MockSyncReader):
+    """Reader whose second (central directory) read_range is short."""
+
+    def read_range(
+        self,
+        offset: int,
+        length: int,
+    ) -> tuple[bytes, dict[str, str]]:
+        data, headers = super().read_range(offset, length)
+        if self.read_count == 2:
+            data = data[:-1]
+        return data, headers
+
+
+class TestHardening:
+    """Admission and bounds checks ported from zipfile."""
+
+    def test_encrypted_entry_rejected(self, stored_zip: bytes) -> None:
+        data = _or_cd_flags(stored_zip, FLAG_ENCRYPTED)
+        reader = MockSyncReader(data)
+        with SyncRemoteZip(reader) as rz, pytest.raises(UnsupportedFeature, match="encrypted"):
+            rz.read("hello.txt")
+
+    def test_patched_data_rejected(self, stored_zip: bytes) -> None:
+        data = _or_cd_flags(stored_zip, FLAG_COMPRESSED_PATCHED_DATA)
+        reader = MockSyncReader(data)
+        with SyncRemoteZip(reader) as rz, pytest.raises(UnsupportedFeature, match="patched data"):
+            rz.read("hello.txt")
+
+    def test_strong_encryption_rejected(self, stored_zip: bytes) -> None:
+        data = _or_cd_flags(stored_zip, FLAG_STRONG_ENCRYPTION)
+        reader = MockSyncReader(data)
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(UnsupportedFeature, match="strong encryption"),
+        ):
+            rz.read("hello.txt")
+
+    def test_encrypted_entry_rejected_by_read_into(self, stored_zip: bytes) -> None:
+        data = _or_cd_flags(stored_zip, FLAG_ENCRYPTED)
+        reader = MockSyncReader(data)
+        with SyncRemoteZip(reader) as rz, pytest.raises(UnsupportedFeature, match="encrypted"):
+            rz.read_into("hello.txt", io.BytesIO())
+
+    def test_header_offset_beyond_archive(self, stored_zip: bytes) -> None:
+        buf = bytearray(stored_zip)
+        offset = _cd_entry_offset(stored_zip, 0)
+        struct.pack_into("<I", buf, offset + 42, len(stored_zip) + 100)
+        reader = MockSyncReader(bytes(buf))
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(BadZipFile, match="beyond the end of the archive"),
+        ):
+            rz.read("hello.txt")
+
+    def test_data_beyond_archive(self, stored_zip: bytes) -> None:
+        # Inflate compress_size so the data ends past the last byte of
+        # the archive.
+        buf = bytearray(stored_zip)
+        offset = _cd_entry_offset(stored_zip, 0)
+        struct.pack_into("<I", buf, offset + 20, len(stored_zip))
+        reader = MockSyncReader(bytes(buf))
+        with SyncRemoteZip(reader) as rz, pytest.raises(BadZipFile, match="beyond the end"):
+            rz.read("hello.txt")
+
+    def test_overlapped_entry_rejected(self, stored_zip: bytes) -> None:
+        # Inflate compress_size so the data runs past the next entry's
+        # local header, but stays inside the archive.
+        buf = bytearray(stored_zip)
+        offset = _cd_entry_offset(stored_zip, 0)
+        struct.pack_into("<I", buf, offset + 20, 100)
+        reader = MockSyncReader(bytes(buf))
+        with SyncRemoteZip(reader) as rz, pytest.raises(BadZipFile, match="Overlapped entries"):
+            rz.read("hello.txt")
+
+    def test_overlapped_entry_rejected_by_read_into(self, stored_zip: bytes) -> None:
+        buf = bytearray(stored_zip)
+        offset = _cd_entry_offset(stored_zip, 0)
+        struct.pack_into("<I", buf, offset + 20, 100)
+        reader = MockSyncReader(bytes(buf))
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(BadZipFile, match="Overlapped entries"),
+        ):
+            rz.read_into("hello.txt", io.BytesIO())
+
+    def test_shared_local_header_warns(self) -> None:
+        # Two entries pointing at the same local header: zipfile warns
+        # (rather than raising) and still reads the data.
+        data = make_zip({"one.txt": b"same data", "two.txt": b"same data"})
+        buf = bytearray(data)
+        first_hoff = struct.unpack_from("<I", buf, _cd_entry_offset(data, 0) + 42)[0]
+        struct.pack_into("<I", buf, _cd_entry_offset(data, 1) + 42, first_hoff)
+        reader = MockSyncReader(bytes(buf))
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.warns(UserWarning, match="Overlapped entries") as caught,
+        ):
+            assert rz.read("two.txt") == b"same data"
+        # The warning is attributed to the caller, not to zipwire.
+        assert caught[0].filename == __file__
+
+    def test_cd_bounds_checked_before_fetch(self, stored_zip: bytes) -> None:
+        # A hostile cd_size must not become a range request: only the
+        # initial tail fetch is allowed before the archive is rejected.
+        buf = bytearray(stored_zip)
+        eocd_pos = buf.rfind(b"PK\x05\x06")
+        struct.pack_into("<I", buf, eocd_pos + 12, 0xFFFFFF00)
+        data = bytes(buf)
+        reader = MockSyncReader(data)
+        with (
+            pytest.raises(BadZipFile, match="beyond the end of the archive"),
+            SyncRemoteZip(reader),
+        ):
+            pass
+        assert reader.requests == [(0, len(data))]
+
+    def test_prefetch_fetch_stays_in_bounds(self, stored_zip: bytes) -> None:
+        # A lying compress_size below the prefetch threshold must not
+        # become a range request past the end of the archive either.
+        buf = bytearray(stored_zip)
+        eocd = find_eocd(stored_zip, len(stored_zip))
+        struct.pack_into("<I", buf, eocd.cd_offset + 20, 5000)
+        data = bytes(buf)
+        reader = MockSyncReader(data)
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(BadZipFile, match="beyond the end of the archive"),
+        ):
+            rz.read("hello.txt")
+        assert all(offset + length <= len(data) for offset, length in reader.requests)
+
+    def test_cd_beyond_archive_rejected_on_load(self, stored_zip: bytes) -> None:
+        buf = bytearray(stored_zip)
+        eocd_pos = buf.rfind(b"PK\x05\x06")
+        cd_offset = struct.unpack_from("<I", buf, eocd_pos + 16)[0]
+        struct.pack_into("<I", buf, eocd_pos + 16, cd_offset + 1000)
+        reader = MockSyncReader(bytes(buf))
+        with (
+            pytest.raises(BadZipFile, match="beyond the end of the archive"),
+            SyncRemoteZip(reader),
+        ):
+            pass
+
+    def test_short_tail_read_rejected(self, stored_zip: bytes) -> None:
+        reader = ShortTailReader(stored_zip)
+        with pytest.raises(BadZipFile, match="tail fetch returned"), SyncRemoteZip(reader):
+            pass
+
+    def test_short_cd_read_rejected(self, large_file_zip: bytes) -> None:
+        reader = ShortCdReader(large_file_zip)
+        with (
+            pytest.raises(BadZipFile, match="Central directory fetch returned"),
+            SyncRemoteZip(reader),
+        ):
             pass

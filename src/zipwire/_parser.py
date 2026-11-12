@@ -96,6 +96,11 @@ def find_eocd(tail: bytes, file_size: int) -> EOCDInfo:
     fields = EOCD_STRUCT.unpack_from(tail, pos)
     # fields: signature, disk_num, disk_cd_start, cd_entries_this_disk,
     #         cd_entries_total, cd_size, cd_offset, comment_length
+    disk_num = fields[1]
+    disk_cd_start = fields[2]
+    if disk_num != 0 or disk_cd_start != 0:
+        raise BadZipFile("zipfiles that span multiple disks are not supported")
+
     cd_entry_count = fields[4]
     cd_size = fields[5]
     cd_offset = fields[6]
@@ -137,10 +142,22 @@ def _parse_zip64_eocd(tail: bytes, eocd_pos: int, file_size: int) -> EOCDInfo:
         raise BadZipFile("ZIP64 EOCD locator signature mismatch")
 
     locator_fields = ZIP64_EOCD_LOCATOR_STRUCT.unpack_from(tail, locator_pos)
+    # fields: signature, disk_with_zip64_eocd, zip64_eocd_offset, total_disks
+    disk_with_zip64_eocd = locator_fields[1]
     zip64_eocd_abs_offset = locator_fields[2]
+    total_disks = locator_fields[3]
+    if disk_with_zip64_eocd != 0 or total_disks > 1:
+        raise BadZipFile("zipfiles that span multiple disks are not supported")
 
     # The ZIP64 EOCD record offset is absolute in the file. Convert to tail-relative.
     tail_start = file_size - len(tail)
+    locator_abs_offset = tail_start + locator_pos
+
+    # The record must start before the locator and fit between the central
+    # directory and the locator.
+    if zip64_eocd_abs_offset + ZIP64_EOCD_SIZE > locator_abs_offset:
+        raise BadZipFile("Corrupt zip64 end of central directory locator")
+
     zip64_eocd_rel = zip64_eocd_abs_offset - tail_start
 
     if zip64_eocd_rel < 0 or zip64_eocd_rel + ZIP64_EOCD_SIZE > len(tail):
@@ -154,9 +171,22 @@ def _parse_zip64_eocd(tail: bytes, eocd_pos: int, file_size: int) -> EOCDInfo:
     # fields: signature, size_of_record, version_made, version_needed,
     #         disk_num, disk_cd_start, cd_entries_this_disk,
     #         cd_entries_total, cd_size, cd_offset
+    # The record's own disk fields and per-disk entry count are ignored,
+    # as in zipfile's _EndRecData64.  Multidisk archives are rejected
+    # from the classic EOCD and the locator, which is where zipfile
+    # checks for them too.
+    record_size = z64_fields[1]
     cd_entry_count = z64_fields[7]
     cd_size = z64_fields[8]
     cd_offset = z64_fields[9]
+
+    # Like zipfile, require the central directory to end exactly where the
+    # ZIP64 EOCD record begins, and the record (with any extensible data)
+    # to end exactly where the locator begins.
+    if cd_offset + cd_size != zip64_eocd_abs_offset:
+        raise BadZipFile("Corrupt zip64 end of central directory record")
+    if zip64_eocd_abs_offset + 12 + record_size != locator_abs_offset:
+        raise BadZipFile("Corrupt zip64 end of central directory record")
 
     return EOCDInfo(
         cd_offset=cd_offset,

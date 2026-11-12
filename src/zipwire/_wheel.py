@@ -136,6 +136,7 @@ class _RemoteWheelMixin:
         data_offset = (
             info.header_offset + LOCAL_FILE_HEADER_SIZE + local_header.data_offset_past_header
         )
+        self._validate_data_region(info, data_offset)  # type: ignore[attr-defined]
         compressed = self._tail_data[data_start : data_start + info.compress_size]
         return info, data_offset, compressed
 
@@ -180,6 +181,7 @@ class SyncRemoteWheel(_RemoteWheelMixin, SyncRemoteZip):
         info = name if isinstance(name, RemoteZipInfo) else self.getinfo(name)
         if info.is_dir():
             return None
+        self._validate_entry(info)
         result = self._resolve_from_tail(info)
         if result is not None:
             return result
@@ -214,6 +216,7 @@ class AsyncRemoteWheel(_RemoteWheelMixin, AsyncRemoteZip):
         info = name if isinstance(name, RemoteZipInfo) else self.getinfo(name)
         if info.is_dir():
             return None
+        self._validate_entry(info)
         result = self._resolve_from_tail(info)
         if result is not None:
             return result

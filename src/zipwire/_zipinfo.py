@@ -6,7 +6,8 @@ import struct
 import typing
 import zipfile
 
-from zipwire._constants import ZIP64_EXTRA_FIELD_ID
+from zipwire._constants import FLAG_UTF8_FILENAME, ZIP64_EXTRA_FIELD_ID
+from zipwire._errors import BadZipFile
 
 if typing.TYPE_CHECKING:
     from zipwire._parser import CentralDirEntry
@@ -24,7 +25,7 @@ class RemoteZipInfo(zipfile.ZipInfo):
         """Construct a ZipInfo from a parsed central directory entry."""
         # Decode filename
         # Bit 11 of flags indicates UTF-8 encoding
-        if entry.flags & 0x800:
+        if entry.flags & FLAG_UTF8_FILENAME:
             filename = entry.filename.decode("utf-8")
         else:
             filename = entry.filename.decode("cp437")
@@ -62,8 +63,18 @@ class RemoteZipInfo(zipfile.ZipInfo):
         return info
 
 
+# Sentinel values that mark a field as stored in the ZIP64 extra field.
+# The 64-bit sentinel can only appear on a round-tripped ZipInfo.
+_ZIP64_SIZE_SENTINELS = (0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
+
+
 def _apply_zip64_extra(info: RemoteZipInfo) -> None:
-    """Parse ZIP64 extra field and update sizes/offset if present."""
+    """Parse ZIP64 extra field and update sizes/offset if present.
+
+    Raises:
+        BadZipFile: If an extra field is truncated or a ZIP64 value that
+            the entry's sentinel fields promise is missing.
+    """
     extra = info.extra
     if not extra:
         return
@@ -71,23 +82,36 @@ def _apply_zip64_extra(info: RemoteZipInfo) -> None:
     offset = 0
     while offset + 4 <= len(extra):
         header_id, data_size = struct.unpack_from("<HH", extra, offset)
-        offset += 4
+        data_start = offset + 4
+        if data_start + data_size > len(extra):
+            raise BadZipFile(f"Corrupt extra field {header_id:#06x} (size={data_size})")
 
         if header_id == ZIP64_EXTRA_FIELD_ID:
             # ZIP64 extended information extra field
-            # Fields appear in order only if the corresponding regular field is 0xFFFFFFFF
+            # Fields appear in order only if the corresponding regular
+            # field holds a sentinel value.
+            data = extra[data_start : data_start + data_size]
             idx = 0
-            if info.file_size == 0xFFFFFFFF and idx + 8 <= data_size:
-                info.file_size = struct.unpack_from("<Q", extra, offset + idx)[0]
+            if info.file_size in _ZIP64_SIZE_SENTINELS:
+                info.file_size = _zip64_value(data, idx, "File size")
                 idx += 8
-            if info.compress_size == 0xFFFFFFFF and idx + 8 <= data_size:
-                info.compress_size = struct.unpack_from("<Q", extra, offset + idx)[0]
+            if info.compress_size == 0xFFFFFFFF:
+                info.compress_size = _zip64_value(data, idx, "Compress size")
                 idx += 8
-            if info.header_offset == 0xFFFFFFFF and idx + 8 <= data_size:
-                info.header_offset = struct.unpack_from("<Q", extra, offset + idx)[0]
+            if info.header_offset == 0xFFFFFFFF:
+                info.header_offset = _zip64_value(data, idx, "Header offset")
                 idx += 8
-            if info.volume == 0xFFFF and idx + 4 <= data_size:
-                info.volume = struct.unpack_from("<I", extra, offset + idx)[0]
+            if info.volume == 0xFFFF:
+                if idx + 4 > len(data):
+                    raise BadZipFile("Corrupt zip64 extra field. Disk start number not found.")
+                info.volume = struct.unpack_from("<I", data, idx)[0]
             return
 
-        offset += data_size
+        offset = data_start + data_size
+
+
+def _zip64_value(data: bytes, idx: int, field: str) -> int:
+    """Unpack one 8-byte ZIP64 value, raising BadZipFile if it is missing."""
+    if idx + 8 > len(data):
+        raise BadZipFile(f"Corrupt zip64 extra field. {field} not found.")
+    return struct.unpack_from("<Q", data, idx)[0]

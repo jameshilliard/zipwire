@@ -74,6 +74,7 @@ class MockSyncReader:
         self.data = data
         self.closed = False
         self.read_count = 0
+        self.requests: list[tuple[int, int]] = []
         self._url = url
 
     @property
@@ -92,6 +93,7 @@ class MockSyncReader:
         length: int,
     ) -> tuple[bytes, dict[str, str]]:
         self.read_count += 1
+        self.requests.append((offset, length))
         total = len(self.data)
         chunk = self.data[offset : offset + length]
         end = offset + len(chunk) - 1
@@ -116,6 +118,7 @@ class MockAsyncReader:
         self.data = data
         self.closed = False
         self.read_count = 0
+        self.requests: list[tuple[int, int]] = []
         self._url = url
 
     @property
@@ -134,6 +137,7 @@ class MockAsyncReader:
         length: int,
     ) -> tuple[bytes, dict[str, str]]:
         self.read_count += 1
+        self.requests.append((offset, length))
         total = len(self.data)
         chunk = self.data[offset : offset + length]
         end = offset + len(chunk) - 1

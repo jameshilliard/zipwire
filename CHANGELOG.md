@@ -14,6 +14,25 @@ releases; they are marked **BREAKING**.
   implementing the new `AsyncWritable` protocol, such as `anyio.AsyncFile`.
   If `write()` returns an awaitable, zipwire awaits it before reading more
   input, so a slow destination applies backpressure to the transfer.
+- New `UnsupportedFeature` exception. Entries that use encryption
+  (general purpose flag bit 0), compressed patched data (bit 5), or
+  strong encryption (bit 6) are now rejected up front instead of feeding
+  unusable data to the decompressor and failing with a confusing CRC or
+  size error.
+
+### Security
+
+- Header parsing and entry admission were hardened to match CPython's
+  `zipfile`: offsets and sizes from the End of Central Directory record
+  and the central directory are validated against the archive size
+  before the central directory is fetched and before entry data is
+  read, range fetches are checked for short responses, overlapped
+  entries whose data runs into the next entry or the central directory
+  (possible zip bomb) are rejected, end records that declare multiple
+  disks are rejected (the ZIP64 EOCD record's own disk fields are
+  ignored, as in CPython), and corrupt ZIP64 records, locators, and
+  extra fields are rejected instead of being silently ignored or
+  misparsed.
 
 ### Changed
 

@@ -19,6 +19,14 @@ class UnsupportedCompression(ZipwireError):
         super().__init__(f"Unsupported compression method: {method}")
 
 
+class UnsupportedFeature(ZipwireError):
+    """The archive or an entry uses a ZIP feature zipwire does not support."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class CRCMismatch(ZipwireError):
     """CRC-32 check failed after decompression."""
 

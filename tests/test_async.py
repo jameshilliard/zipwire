@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import struct
 import typing
 import zipfile
 
@@ -10,13 +11,15 @@ import pytest
 
 from tests.conftest import MockAsyncReader, make_zip
 from zipwire import AsyncRemoteZip, EOCDInfo
-from zipwire._constants import STREAM_CHUNK_SIZE
+from zipwire._constants import FLAG_COMPRESSED_PATCHED_DATA, FLAG_ENCRYPTED, STREAM_CHUNK_SIZE
 from zipwire._errors import (
     BadZipFile,
     FileNotFoundInZip,
     FileTooLarge,
     RangeRequestUnsupported,
+    UnsupportedFeature,
 )
+from zipwire._parser import find_eocd
 from zipwire._zipinfo import RemoteZipInfo
 
 if typing.TYPE_CHECKING:
@@ -434,5 +437,98 @@ class TestAsyncRemoteZip:
 
         reader.head = _head_no_cl
         with pytest.raises(RangeRequestUnsupported, match="Content-Length"):
+            async with AsyncRemoteZip(reader):
+                pass
+
+
+class ShortTailAsyncReader(MockAsyncReader):
+    """Reader whose first (tail) read_range returns one byte too few."""
+
+    async def read_range(
+        self,
+        offset: int,
+        length: int,
+    ) -> tuple[bytes, dict[str, str]]:
+        data, headers = await super().read_range(offset, length)
+        if self.read_count == 1:
+            data = data[:-1]
+        return data, headers
+
+
+class TestHardening:
+    """Admission and bounds checks ported from zipfile (async path)."""
+
+    async def test_encrypted_entry_rejected(self, stored_zip: bytes) -> None:
+        buf = bytearray(stored_zip)
+        eocd = find_eocd(stored_zip, len(stored_zip))
+        offset = eocd.cd_offset
+        flags = struct.unpack_from("<H", buf, offset + 8)[0]
+        struct.pack_into("<H", buf, offset + 8, flags | FLAG_ENCRYPTED)
+        reader = MockAsyncReader(bytes(buf))
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(UnsupportedFeature, match="encrypted"):
+                await rz.read("hello.txt")
+
+    async def test_patched_data_rejected(self, stored_zip: bytes) -> None:
+        buf = bytearray(stored_zip)
+        eocd = find_eocd(stored_zip, len(stored_zip))
+        offset = eocd.cd_offset
+        flags = struct.unpack_from("<H", buf, offset + 8)[0]
+        struct.pack_into("<H", buf, offset + 8, flags | FLAG_COMPRESSED_PATCHED_DATA)
+        reader = MockAsyncReader(bytes(buf))
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(UnsupportedFeature, match="patched data"):
+                await rz.read("hello.txt")
+
+    async def test_overlapped_entry_rejected(self, stored_zip: bytes) -> None:
+        # Inflate compress_size so the data runs past the next entry's
+        # local header, but stays inside the archive.
+        buf = bytearray(stored_zip)
+        eocd = find_eocd(stored_zip, len(stored_zip))
+        struct.pack_into("<I", buf, eocd.cd_offset + 20, 100)
+        reader = MockAsyncReader(bytes(buf))
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(BadZipFile, match="Overlapped entries"):
+                await rz.read("hello.txt")
+
+    async def test_cd_bounds_checked_before_fetch(self, stored_zip: bytes) -> None:
+        # A hostile cd_size must not become a range request: only the
+        # initial tail fetch is allowed before the archive is rejected.
+        buf = bytearray(stored_zip)
+        eocd_pos = buf.rfind(b"PK\x05\x06")
+        struct.pack_into("<I", buf, eocd_pos + 12, 0xFFFFFF00)
+        data = bytes(buf)
+        reader = MockAsyncReader(data)
+        with pytest.raises(BadZipFile, match="beyond the end of the archive"):
+            async with AsyncRemoteZip(reader):
+                pass
+        assert reader.requests == [(0, len(data))]
+
+    async def test_prefetch_fetch_stays_in_bounds(self, stored_zip: bytes) -> None:
+        # A lying compress_size below the prefetch threshold must not
+        # become a range request past the end of the archive either.
+        buf = bytearray(stored_zip)
+        eocd = find_eocd(stored_zip, len(stored_zip))
+        struct.pack_into("<I", buf, eocd.cd_offset + 20, 5000)
+        data = bytes(buf)
+        reader = MockAsyncReader(data)
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(BadZipFile, match="beyond the end of the archive"):
+                await rz.read("hello.txt")
+        assert all(offset + length <= len(data) for offset, length in reader.requests)
+
+    async def test_cd_beyond_archive_rejected_on_load(self, stored_zip: bytes) -> None:
+        buf = bytearray(stored_zip)
+        eocd_pos = buf.rfind(b"PK\x05\x06")
+        cd_offset = struct.unpack_from("<I", buf, eocd_pos + 16)[0]
+        struct.pack_into("<I", buf, eocd_pos + 16, cd_offset + 1000)
+        reader = MockAsyncReader(bytes(buf))
+        with pytest.raises(BadZipFile, match="beyond the end of the archive"):
+            async with AsyncRemoteZip(reader):
+                pass
+
+    async def test_short_tail_read_rejected(self, stored_zip: bytes) -> None:
+        reader = ShortTailAsyncReader(stored_zip)
+        with pytest.raises(BadZipFile, match="tail fetch returned"):
             async with AsyncRemoteZip(reader):
                 pass

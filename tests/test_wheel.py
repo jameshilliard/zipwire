@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import io
+import struct
 import zipfile
 
 import pytest
 
 from tests.conftest import MockAsyncReader, MockSyncReader
 from zipwire import AsyncRemoteWheel, SyncRemoteWheel
-from zipwire._errors import BadZipFile
+from zipwire._constants import CENTRAL_DIR_SIZE, FLAG_ENCRYPTED
+from zipwire._errors import BadZipFile, UnsupportedFeature
+from zipwire._parser import find_eocd
 from zipwire._wheel import _dist_info_from_url
 
 # ---------------------------------------------------------------------------
@@ -282,3 +285,83 @@ class TestAsyncRemoteWheel:
         async with AsyncRemoteWheel(reader) as whl:
             metadata = await whl.read(f"{whl.dist_info_dir}METADATA")
         assert b"Name: example_pkg" in metadata
+
+
+def _last_cd_entry_offset(data: bytes) -> int:
+    """Absolute offset of the last central directory entry in *data*."""
+    eocd = find_eocd(data, len(data))
+    offset = eocd.cd_offset
+    for _ in range(eocd.cd_entry_count - 1):
+        fn_len, extra_len, comment_len = struct.unpack_from("<HHH", data, offset + 28)
+        offset += CENTRAL_DIR_SIZE + fn_len + extra_len + comment_len
+    return offset
+
+
+def _set_last_cd_flags(data: bytes, mask: int) -> bytes:
+    """Set general purpose flag bits on the last central directory entry."""
+    buf = bytearray(data)
+    offset = _last_cd_entry_offset(data)
+    flags = struct.unpack_from("<H", buf, offset + 8)[0]
+    struct.pack_into("<H", buf, offset + 8, flags | mask)
+    return bytes(buf)
+
+
+def _inflate_last_cd_compress_size(data: bytes, delta: int) -> bytes:
+    """Grow the last central directory entry's compress_size by *delta*."""
+    buf = bytearray(data)
+    offset = _last_cd_entry_offset(data)
+    csize = struct.unpack_from("<I", buf, offset + 20)[0]
+    struct.pack_into("<I", buf, offset + 20, csize + delta)
+    return bytes(buf)
+
+
+class TestWheelHardening:
+    """The wheel tail-buffer fast path applies the same entry checks."""
+
+    def test_encrypted_entry_rejected(self) -> None:
+        """Encrypted dist-info entry is rejected when served from the tail."""
+        data, filename = _make_wheel()
+        reader = MockSyncReader(
+            _set_last_cd_flags(data, FLAG_ENCRYPTED),
+            url=f"https://example.com/{filename}",
+        )
+        with (
+            SyncRemoteWheel(reader) as whl,
+            pytest.raises(UnsupportedFeature, match="encrypted"),
+        ):
+            whl.read(f"{whl.dist_info_dir}RECORD")
+
+    def test_overlapped_entry_rejected(self) -> None:
+        """Entry data overlapping the central directory is rejected."""
+        data, filename = _make_wheel()
+        # Inflate RECORD's compress_size just enough to cross into the
+        # central directory, which is the boundary for the last entry,
+        # but stay inside the archive.
+        corrupted = _inflate_last_cd_compress_size(data, 30)
+        reader = MockSyncReader(corrupted, url=f"https://example.com/{filename}")
+        with (
+            SyncRemoteWheel(reader) as whl,
+            pytest.raises(BadZipFile, match="Overlapped entries"),
+        ):
+            whl.read(f"{whl.dist_info_dir}RECORD")
+
+    @pytest.mark.asyncio
+    async def test_async_encrypted_entry_rejected(self) -> None:
+        """The async wheel applies the entry checks on the tail fast path."""
+        data, filename = _make_wheel()
+        reader = MockAsyncReader(
+            _set_last_cd_flags(data, FLAG_ENCRYPTED),
+            url=f"https://example.com/{filename}",
+        )
+        async with AsyncRemoteWheel(reader) as whl:
+            with pytest.raises(UnsupportedFeature, match="encrypted"):
+                await whl.read(f"{whl.dist_info_dir}RECORD")
+
+    @pytest.mark.asyncio
+    async def test_async_overlapped_entry_rejected(self) -> None:
+        data, filename = _make_wheel()
+        corrupted = _inflate_last_cd_compress_size(data, 30)
+        reader = MockAsyncReader(corrupted, url=f"https://example.com/{filename}")
+        async with AsyncRemoteWheel(reader) as whl:
+            with pytest.raises(BadZipFile, match="Overlapped entries"):
+                await whl.read(f"{whl.dist_info_dir}RECORD")

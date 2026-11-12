@@ -17,6 +17,7 @@ from zipwire._errors import (
 )
 
 if typing.TYPE_CHECKING:
+    import lzma
     from collections.abc import Iterator
 
 
@@ -35,6 +36,128 @@ class DeflateDecompressor(Decompressor, typing.Protocol):
 class IncrementalDecompressor(Decompressor, typing.Protocol):
     @property
     def needs_input(self) -> bool: ...
+
+
+class ZipLZMADecompressor:
+    """Incremental decoder for ZIP-LZMA (method 14) compressed data.
+
+    Buffers the ZIP-LZMA header from the first input bytes -- two
+    version bytes, a two-byte little-endian property size, then that
+    many bytes of LZMA1 properties -- and decodes the remaining raw
+    LZMA1 stream.  The version bytes are deliberately not validated:
+    the ZIP specification says 1.0 while stdlib :mod:`zipfile` writes
+    9.4, and the properties fully determine the decoder.
+
+    Implements the :class:`IncrementalDecompressor` protocol.
+    """
+
+    # Fixed part of the ZIP-LZMA payload header: 2 version bytes followed
+    # by a 2-byte little-endian size of the LZMA1 properties that follow.
+    _FIXED_HEADER_SIZE = 4
+
+    # The largest dictionary a real encoder writes into a ZIP is 64 MiB
+    # (xz and 7-Zip "ultra" mode, preset 9); stdlib zipfile writes
+    # 8 MiB.  A larger claim in the properties comes from a hostile or
+    # broken archive and is clamped, so a crafted entry cannot reserve
+    # absurd address space and commit charge.  Clamping cannot corrupt
+    # decoding: an LZMA match never references farther back than the
+    # output decoded so far, and a stream that does need more fails
+    # with a clean "Corrupt input data" error.
+    _MAX_DICT_SIZE = 64 * 1024 * 1024
+
+    def __init__(self) -> None:
+        try:
+            import lzma
+        except ImportError:  # pragma: no cover
+            raise UnsupportedCompression(CompressionMethod.LZMA) from None
+
+        self._lzma = lzma
+        self._decoder: lzma.LZMADecompressor | None = None
+        self._pending = bytearray()
+        self.eof = False
+
+    @property
+    def needs_input(self) -> bool:
+        # While the header is still incomplete, more input is required;
+        # afterwards defer to the wrapped decoder so a bounded
+        # decompress() call can be drained across reads.
+        if self._decoder is None:
+            return True
+        return self._decoder.needs_input
+
+    @property
+    def header_pending(self) -> bool:
+        """Whether the ZIP-LZMA header is still incomplete."""
+        return self._decoder is None
+
+    def _lzma1_filter(self, props: bytes) -> dict[str, int]:
+        """Translate ZIP-LZMA properties into a raw LZMA1 filter spec.
+
+        A ZIP-LZMA (method 14) payload is not an xz or ``.lzma``
+        container, which is why ``lzma.decompress()`` and a plain
+        ``lzma.LZMADecompressor()`` reject it.  After the header it
+        holds a raw LZMA1 stream, which needs a ``FORMAT_RAW`` decoder
+        configured from the properties.
+
+        Security: *props* comes from the remote archive and is
+        untrusted.  The lc/lp/pb encoding and the property length are
+        validated here and the dictionary size claim is clamped to
+        :attr:`_MAX_DICT_SIZE`; everything else is left to liblzma,
+        which rejects values it cannot use before any decoding happens.
+        The decoded output itself stays bounded by the CRC and size
+        verification.
+        """
+        lzma = self._lzma
+        if len(props) != 5:
+            raise lzma.LZMAError(f"invalid ZIP-LZMA properties size: {len(props)}")
+        encoded = props[0]
+        if encoded >= 9 * 5 * 5:  # lc < 9, lp < 5, pb < 5
+            raise lzma.LZMAError("invalid ZIP-LZMA lc/lp/pb properties")
+        pb, rest = divmod(encoded, 45)
+        lp, lc = divmod(rest, 9)
+        dict_size = min(int.from_bytes(props[1:5], "little"), self._MAX_DICT_SIZE)
+        return {
+            "id": lzma.FILTER_LZMA1,
+            "lc": lc,
+            "lp": lp,
+            "pb": pb,
+            "dict_size": dict_size,
+        }
+
+    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+        if self._decoder is None:
+            self._pending += data
+            if len(self._pending) < self._FIXED_HEADER_SIZE:
+                return b""
+            props_size = int.from_bytes(self._pending[2:4], "little")
+            if len(self._pending) < self._FIXED_HEADER_SIZE + props_size:
+                return b""
+            props = bytes(self._pending[4 : 4 + props_size])
+            self._decoder = self._lzma.LZMADecompressor(
+                self._lzma.FORMAT_RAW,
+                filters=[self._lzma1_filter(props)],
+            )
+            data = bytes(self._pending[4 + props_size :])
+            self._pending.clear()
+        result = self._decoder.decompress(data, max_length)
+        self.eof = self._decoder.eof
+        return result
+
+
+def _decompress_zip_lzma(data: bytes) -> bytes:
+    """Decode a complete ZIP-LZMA payload in one shot."""
+    try:
+        import lzma
+    except ImportError:  # pragma: no cover
+        raise UnsupportedCompression(CompressionMethod.LZMA) from None
+
+    decoder = ZipLZMADecompressor()
+    result = decoder.decompress(data)
+    if decoder.header_pending:
+        raise lzma.LZMAError("ZIP-LZMA header is truncated")
+    if not decoder.eof:
+        raise lzma.LZMAError("compressed data ended before the end-of-stream marker")
+    return result
 
 
 def decompress(
@@ -74,12 +197,7 @@ def decompress(
 
             result = bz2.decompress(data)
         case CompressionMethod.LZMA:
-            try:
-                import lzma
-            except ImportError:  # pragma: no cover
-                raise UnsupportedCompression(method) from None
-
-            result = lzma.decompress(data)
+            result = _decompress_zip_lzma(data)
         case CompressionMethod.ZSTANDARD:
             try:
                 from compression.zstd import decompress as _zstd_decompress
@@ -190,12 +308,7 @@ class StreamingDecompressor:
 
                 self._incremental = bz2.BZ2Decompressor()
             case CompressionMethod.LZMA:
-                try:
-                    import lzma
-                except ImportError:  # pragma: no cover
-                    raise UnsupportedCompression(method) from None
-
-                self._incremental = lzma.LZMADecompressor()
+                self._incremental = ZipLZMADecompressor()
             case CompressionMethod.ZSTANDARD:
                 try:
                     from compression.zstd import ZstdDecompressor

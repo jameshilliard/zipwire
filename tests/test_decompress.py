@@ -223,21 +223,88 @@ def test_streaming_bzip2_chunked() -> None:
 # --- lzma ---
 
 
-def test_decompress_lzma() -> None:
-    import lzma
+def zip_lzma_compress(data: bytes) -> bytes:
+    """Compress *data* as a ZIP-LZMA (method 14) payload.
 
+    A ZIP-LZMA payload is not an xz or .lzma container: it starts with
+    two version bytes, a two-byte little-endian property size, five
+    bytes of raw LZMA1 properties (lc=3, lp=0, pb=2, 8 MiB dictionary),
+    and then the raw LZMA1 stream with an end-of-stream marker.  This
+    mirrors what :mod:`zipfile` writes for ``ZIP_LZMA``.
+    """
+    filters = [{"id": lzma.FILTER_LZMA1, "lc": 3, "lp": 0, "pb": 2, "dict_size": 8 << 20}]
+    props = bytes([2 * 45 + 0 * 9 + 3]) + (8 << 20).to_bytes(4, "little")
+    compressor = lzma.LZMACompressor(lzma.FORMAT_RAW, filters=filters)
+    header = bytes((9, 4)) + len(props).to_bytes(2, "little") + props
+    return header + compressor.compress(data) + compressor.flush()
+
+
+def test_decompress_lzma() -> None:
     original = b"Hello, LZMA World!" * 50
-    compressed = lzma.compress(original)
+    compressed = zip_lzma_compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     result = decompress(compressed, method=14, expected_size=len(original), expected_crc=crc)
     assert result == original
 
 
-def test_streaming_lzma() -> None:
-    import lzma
+def test_decompress_lzma_empty() -> None:
+    compressed = zip_lzma_compress(b"")
+    crc = zlib.crc32(b"") & 0xFFFFFFFF
+    result = decompress(compressed, method=14, expected_size=0, expected_crc=crc)
+    assert result == b""
 
+
+def test_decompress_lzma_bad_header() -> None:
+    """Malformed ZIP-LZMA headers are rejected instead of decoded."""
+    # Payload shorter than the four fixed header bytes.
+    with pytest.raises(lzma.LZMAError):
+        decompress(b"\x09\x04", method=14, expected_size=0, expected_crc=0)
+    # Property size that the payload never satisfies.
+    with pytest.raises(lzma.LZMAError):
+        decompress(b"\x09\x04\xff\xff", method=14, expected_size=0, expected_crc=0)
+    # Property size other than the five bytes LZMA1 properties use.
+    bad_size = b"\x09\x04\x04\x00\x5d\x00\x00\x80\x00"
+    with pytest.raises(lzma.LZMAError):
+        decompress(bad_size, method=14, expected_size=0, expected_crc=0)
+    # Properties byte with an out-of-range lc/lp/pb encoding.
+    bad_props = b"\x09\x04\x05\x00\xe1\x00\x00\x80\x00"
+    with pytest.raises(lzma.LZMAError):
+        decompress(bad_props, method=14, expected_size=0, expected_crc=0)
+
+
+def test_decompress_lzma_truncated() -> None:
+    """A one-shot decode of a stream missing its end marker is rejected."""
+    original = b"Hello, LZMA World!" * 50
+    compressed = zip_lzma_compress(original)
+    with pytest.raises(lzma.LZMAError):
+        decompress(compressed[:-6], method=14, expected_size=len(original), expected_crc=0)
+
+
+def test_decompress_lzma_oversized_dict_clamped() -> None:
+    """An oversized dictionary claim is clamped instead of trusted.
+
+    The properties come from the remote archive.  A hostile entry can
+    claim a multi-gigabyte dictionary; decoding clamps it to
+    ZipLZMADecompressor._MAX_DICT_SIZE, which does not affect the
+    decoded bytes because a match never references farther back than
+    the output decoded so far.
+    """
+    original = b"Hello, LZMA World!" * 50
+    crc = zlib.crc32(original) & 0xFFFFFFFF
+    compressed = bytearray(zip_lzma_compress(original))
+    # Patch the dictionary size inside the properties (the last four
+    # bytes of the five-byte properties that follow the four header
+    # bytes) to claim 4 GiB - 1.
+    compressed[5:9] = (0xFFFFFFFF).to_bytes(4, "little")
+    result = decompress(
+        bytes(compressed), method=14, expected_size=len(original), expected_crc=crc
+    )
+    assert result == original
+
+
+def test_streaming_lzma() -> None:
     original = b"Streaming LZMA data" * 100
-    compressed = lzma.compress(original)
+    compressed = zip_lzma_compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=14, expected_crc=crc)
@@ -247,10 +314,9 @@ def test_streaming_lzma() -> None:
 
 
 def test_streaming_lzma_chunked() -> None:
-    import lzma
-
+    """Feeds smaller than the ZIP-LZMA header exercise its buffering."""
     original = b"ABCDEFGH" * 500
-    compressed = lzma.compress(original)
+    compressed = zip_lzma_compress(original)
     crc = zlib.crc32(original) & 0xFFFFFFFF
     dest = io.BytesIO()
     sd = StreamingDecompressor(method=14, expected_crc=crc)
@@ -258,6 +324,29 @@ def test_streaming_lzma_chunked() -> None:
         dest.write(sd.feed(compressed[pos : pos + 100]))
     sd.finish()
     assert dest.getvalue() == original
+
+
+def test_streaming_lzma_truncated() -> None:
+    """A stream cut inside the end-of-stream marker is rejected.
+
+    The partial output already matches the expected size and CRC, so
+    only the end-of-stream check catches the truncation.
+    """
+    original = b"Hello, LZMA World!" * 50
+    compressed = zip_lzma_compress(original)
+    crc = zlib.crc32(original) & 0xFFFFFFFF
+    sd = StreamingDecompressor(method=14, expected_crc=crc, expected_size=len(original))
+    sd.feed(compressed[:-6])
+    with pytest.raises(TruncatedStream):
+        sd.finish()
+
+
+def test_streaming_lzma_header_truncated() -> None:
+    """A stream that ends inside the ZIP-LZMA header is rejected."""
+    sd = StreamingDecompressor(method=14, expected_crc=0)
+    sd.feed(b"\x09\x04\x05")
+    with pytest.raises(TruncatedStream):
+        sd.finish()
 
 
 # --- zstandard ---
@@ -349,7 +438,7 @@ def _deflate_compress(data: bytes) -> bytes:
     [
         (8, _deflate_compress),
         (12, bz2.compress),
-        (14, lzma.compress),
+        (14, zip_lzma_compress),
         pytest.param(93, _zstd_compress, marks=needs_zstd),
     ],
     ids=["deflated", "bzip2", "lzma", "zstandard"],
@@ -483,7 +572,7 @@ def test_streaming_finish_truncated() -> None:
     [
         (8, _deflate_compress),
         (12, bz2.compress),
-        (14, lzma.compress),
+        (14, zip_lzma_compress),
         pytest.param(93, _zstd_compress, marks=needs_zstd),
     ],
     ids=["deflated", "bzip2", "lzma", "zstandard"],

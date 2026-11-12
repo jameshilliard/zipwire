@@ -36,6 +36,13 @@ releases; they are marked **BREAKING**.
   deterministically when a range request fails or extraction stops early,
   rather than waiting for generator finalization, and the reader is closed
   when the archive context manager fails to load.
+- ZIP-LZMA (method 14) entries can be read again. The ZIP-LZMA payload
+  header (version, property size, LZMA1 properties) is now parsed and the
+  raw LZMA1 stream is decoded with a matching filter, instead of handing
+  the payload to `lzma.decompress()`, which expects a container format
+  and failed on every entry with `lzma.LZMAError` (#71). The dictionary
+  size claim in the properties is clamped to 64 MiB, the largest
+  dictionary real encoders such as xz ultra mode (preset 9) write.
 
 ### Security
 

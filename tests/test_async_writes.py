@@ -17,6 +17,7 @@ from tests.conftest import (
     needs_zstd,
 )
 from zipwire import AsyncRemoteZip, AsyncWritable, CRCMismatch, FileTooLarge
+from zipwire._write import awrite_all
 
 if typing.TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -122,6 +123,120 @@ async def test_writer_returning_non_awaitable(stored_zip: bytes) -> None:
     async with AsyncRemoteZip(MockAsyncReader(stored_zip)) as archive:
         await archive.read_into("hello.txt", destination)
     assert destination.data == b"Hello, World!"
+
+
+async def test_writer_returning_awaitable_int() -> None:
+    """Await int subclasses instead of treating their value as a completed write."""
+    content = b"Hello, World!"
+    awaited_bytes = 0
+
+    class AwaitableCount(int):
+        def __await__(self):
+            async def complete() -> int:
+                nonlocal awaited_bytes
+                await asyncio.sleep(0)
+                awaited_bytes += int(self)
+                return int(self)
+
+            return complete().__await__()
+
+    class Destination:
+        def write(self, chunk: bytes) -> AwaitableCount:
+            return AwaitableCount(len(chunk))
+
+    async with AsyncRemoteZip(MockAsyncReader(make_zip({"file": content}))) as archive:
+        await archive.read_into("file", Destination())
+    assert awaited_bytes == len(content)
+
+
+def test_awrite_all_is_loop_agnostic() -> None:
+    """awrite_all must not use event-loop primitives such as asyncio.sleep(0).
+
+    A checkpoint like asyncio.sleep(0) passes under asyncio but raises
+    RuntimeError on other event loops such as trio.  Driving the coroutine
+    by hand, with no event loop at all, detects any await that needs one:
+    the coroutine must run to completion without ever suspending.
+    """
+    chunks = [b"Hello, ", b"World!"]
+
+    class SyncWriter:
+        def __init__(self) -> None:
+            self.data = bytearray()
+
+        def write(self, chunk: bytes) -> int:
+            self.data.extend(chunk)
+            return len(chunk)
+
+    class AsyncShortWriter:
+        """Accept at most five bytes per call to exercise the retry loop."""
+
+        def __init__(self) -> None:
+            self.data = bytearray()
+
+        async def write(self, chunk: bytes) -> int:
+            count = min(5, len(chunk))
+            self.data.extend(chunk[:count])
+            return count
+
+    for destination in (SyncWriter(), AsyncShortWriter()):
+        coroutine = awrite_all(destination, chunks)
+        try:
+            coroutine.send(None)
+        except StopIteration:
+            pass
+        else:
+            coroutine.close()
+            pytest.fail("awrite_all suspended on an event-loop primitive")
+        assert destination.data == b"Hello, World!"
+
+
+@pytest.mark.parametrize("size", [100, 70_000])
+@pytest.mark.parametrize("write_limit", [None, 3])
+async def test_async_partial_writes(size: int, write_limit: int | None) -> None:
+    """Retry the unconsumed suffix after awaiting each partial write."""
+    content = Random(0).randbytes(size)
+    output = bytearray()
+
+    class Destination:
+        async def write(self, chunk: bytes) -> int | None:
+            await asyncio.sleep(0)
+            count = len(chunk) if write_limit is None else min(write_limit, len(chunk))
+            output.extend(chunk[:count])
+            return None if write_limit is None else count
+
+    reader = TrackingReader(make_zip({"file": content}))
+    async with AsyncRemoteZip(reader) as archive:
+        await archive.read_into("file", Destination())
+    assert output == content
+    if size == 70_000:
+        assert reader.stream_closed
+
+
+@pytest.mark.parametrize("size", [100, 70_000])
+@pytest.mark.parametrize("failure", ["zero", "negative", "oversized", "noninteger", "boolean"])
+async def test_async_invalid_write_count(size: int, failure: str) -> None:
+    """Validate resolved counts and release streamed input on failure."""
+
+    class Destination:
+        async def write(self, chunk: bytes) -> int:
+            await asyncio.sleep(0)
+            if failure == "zero":
+                return 0
+            if failure == "negative":
+                return -1
+            if failure == "oversized":
+                return len(chunk) + 1
+            if failure == "boolean":
+                # bool is an int subclass; a success flag is not a count.
+                return typing.cast("int", True)
+            return typing.cast("int", "invalid")
+
+    reader = TrackingReader(make_zip({"file": b"x" * size}))
+    async with AsyncRemoteZip(reader) as archive:
+        with pytest.raises(OSError, match="invalid byte count"):
+            await archive.read_into("file", Destination())
+        if size == 70_000:
+            assert reader.stream_closed
 
 
 def test_async_writable_is_not_runtime_checkable() -> None:

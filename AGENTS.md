@@ -47,6 +47,10 @@ The human contribution workflow (issues, pull requests, security reports) is in
   Do not use `from foo import bar` inside functions, methods, or test bodies.
   Module-level imports in `try/except ImportError` blocks and
   `if TYPE_CHECKING:` blocks are fine.
+- **Keep async code loop-agnostic.** Do not use asyncio-only primitives
+  such as `asyncio.sleep(0)` in async code paths. Awaiting an awaitable
+  already yields control on every event loop, while asyncio-only calls
+  raise `RuntimeError` under trio and other non-asyncio loops.
 
 ## Testing rules
 

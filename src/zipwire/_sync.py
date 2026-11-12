@@ -13,6 +13,7 @@ from zipwire._constants import (
 from zipwire._decompress import StreamingDecompressor, decompress
 from zipwire._errors import FileTooLarge, RangeRequestUnsupported
 from zipwire._parser import find_eocd, parse_local_file_header
+from zipwire._write import write_all
 from zipwire._zipinfo import RemoteZipInfo
 
 if typing.TYPE_CHECKING:
@@ -193,6 +194,16 @@ class SyncRemoteZip(RemoteZipBase):
         :exc:`~zipwire.SizeMismatch`; a shortfall is detected once the
         stream ends.
 
+        Writes are checked: a destination that accepts fewer bytes than
+        given is retried with the remaining bytes, while a byte count that
+        is not an :class:`int`, or is zero, negative, or oversized, raises
+        :exc:`OSError`.  A ``write()`` that returns ``None`` is assumed to
+        have accepted the whole chunk.
+
+        The caller owns *dest*: this method does not flush or close it.
+        Errors may leave partial output; only a successful return indicates
+        that CRC-32 verification passed.
+
         Args:
             name: Filename string or RemoteZipInfo object.
             dest: A writable file-like object (e.g. ``io.BytesIO``, open file).
@@ -219,7 +230,5 @@ class SyncRemoteZip(RemoteZipBase):
         else:
             encoded = self._reader.stream_range(data_offset, info.compress_size)
         for chunk in encoded:
-            for output in sd.feed_chunks(chunk):
-                if output:
-                    dest.write(output)
+            write_all(dest, sd.feed_chunks(chunk))
         sd.finish()

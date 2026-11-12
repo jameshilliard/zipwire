@@ -36,7 +36,9 @@ Stream a file to disk
 chunks and decompresses on the fly, keeping peak memory low even for large
 entries.  Decoded output is passed to the destination in chunks of at most
 2 MiB, so a highly compressible entry cannot inflate into a single large
-allocation:
+allocation.  Partial writes are retried, so raw unbuffered streams work as
+destinations.  A destination's ``write()`` must return the number of bytes
+accepted, or ``None`` for the whole chunk:
 
 .. code-block:: python
 
@@ -154,8 +156,10 @@ Async streaming to disk
 :meth:`~zipwire.AsyncRemoteZip.read_into` also accepts asynchronous
 writable objects, such as ``anyio.AsyncFile``.  When ``write()`` returns
 an awaitable, zipwire waits for that write to finish before it reads more
-input, so a slow destination throttles the download.  Any object with an
-awaitable ``write()`` works; the example uses anyio:
+input, so a slow destination throttles the download.  Partial writes are
+retried in both modes, and a byte count that is not an integer, or is zero,
+negative, or oversized, raises ``OSError``.  Any object with an awaitable
+``write()`` works; the example uses anyio:
 
 .. code-block:: python
 

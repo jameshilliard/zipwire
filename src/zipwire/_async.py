@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import typing
 from contextlib import aclosing
-from inspect import isawaitable
 
 from zipwire._base import RemoteZipBase
 from zipwire._constants import (
@@ -16,6 +14,7 @@ from zipwire._constants import (
 from zipwire._decompress import StreamingDecompressor, adecompress
 from zipwire._errors import FileTooLarge, RangeRequestUnsupported
 from zipwire._parser import find_eocd, parse_local_file_header
+from zipwire._write import awrite_all
 from zipwire._zipinfo import RemoteZipInfo
 
 if typing.TYPE_CHECKING:
@@ -203,8 +202,13 @@ class AsyncRemoteZip(RemoteZipBase):
         next chunk is read or decompressed, so a slow destination applies
         backpressure to the transfer.  Synchronous destinations such as
         :class:`io.BytesIO` are supported, too.  Their writes run on the
-        event-loop thread. Each write must accept the whole chunk or raise
-        an exception; a short write is not retried.
+        event-loop thread.
+
+        Writes are checked: a destination that accepts fewer bytes than
+        given is retried with the remaining bytes, while a byte count that
+        is not an :class:`int`, or is zero, negative, or oversized, raises
+        :exc:`OSError`.  A ``write()`` that returns ``None`` is assumed to
+        have accepted the whole chunk.
 
         The caller owns *dest*: this method does not flush, close, or
         commit it.  Errors and cancellation may leave partial output; only
@@ -235,15 +239,7 @@ class AsyncRemoteZip(RemoteZipBase):
         outputs = self._output_chunks(info, data_offset, prefetched, max_file_size)
         async with aclosing(outputs) as chunks:
             async for output in chunks:
-                if not output:
-                    await asyncio.sleep(0)  # yield to loop
-                    continue
-                written = dest.write(output)
-                # Sync file writes return the byte count; skip the costlier
-                # awaitable probe for the common case.
-                if type(written) is not int and isawaitable(written):
-                    await written
-                await asyncio.sleep(0)  # yield to loop
+                await awrite_all(dest, (output,))
 
     async def _output_chunks(
         self,

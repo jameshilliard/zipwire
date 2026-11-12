@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import typing
 import zipfile
 
 import pytest
@@ -270,6 +271,46 @@ class TestSyncRemoteZip:
             rz.read_into("entry.bin", Destination())
         assert bytes(output) == content
         assert max(sizes) <= STREAM_CHUNK_SIZE
+
+    @pytest.mark.parametrize("size", [100, 70_000])
+    @pytest.mark.parametrize("write_limit", [None, 3])
+    def test_read_into_partial_writes(self, size: int, write_limit: int | None) -> None:
+        """Retry the unconsumed suffix of a short write."""
+        content = (bytes(range(256)) * (size // 256 + 1))[:size]
+        output = bytearray()
+
+        class Destination:
+            def write(self, chunk: bytes) -> int | None:
+                count = len(chunk) if write_limit is None else min(write_limit, len(chunk))
+                output.extend(chunk[:count])
+                return None if write_limit is None else count
+
+        reader = MockSyncReader(make_zip({"entry.bin": content}))
+        with SyncRemoteZip(reader) as rz:
+            rz.read_into("entry.bin", Destination())
+        assert bytes(output) == content
+
+    @pytest.mark.parametrize("size", [100, 70_000])
+    @pytest.mark.parametrize("failure", ["zero", "negative", "oversized", "noninteger", "boolean"])
+    def test_read_into_invalid_write_count(self, size: int, failure: str) -> None:
+        """Reject byte counts that would stall or corrupt the write loop."""
+
+        class Destination:
+            def write(self, chunk: bytes) -> int | None:
+                if failure == "zero":
+                    return 0
+                if failure == "negative":
+                    return -1
+                if failure == "oversized":
+                    return len(chunk) + 1
+                if failure == "boolean":
+                    # bool is an int subclass; a success flag is not a count.
+                    return typing.cast("int", True)
+                return typing.cast("int", "invalid")
+
+        reader = MockSyncReader(make_zip({"entry.bin": b"x" * size}))
+        with SyncRemoteZip(reader) as rz, pytest.raises(OSError, match="invalid byte count"):
+            rz.read_into("entry.bin", Destination())
 
     def test_read_zstandard(self, zstandard_zip: bytes) -> None:
         reader = MockSyncReader(zstandard_zip)

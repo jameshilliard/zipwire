@@ -121,22 +121,32 @@ class AsyncReader(typing.Protocol):
 
 @typing.runtime_checkable
 class Writable(typing.Protocol):
-    """Protocol for writable file-like objects (io.BytesIO, io.BufferedWriter, etc.)."""
+    """Protocol for writable file-like objects (io.BytesIO, io.BufferedWriter, etc.).
 
-    def write(self, data: bytes, /) -> object: ...
+    ``write()`` returns the number of bytes accepted, or ``None`` when the
+    whole chunk was written.  Buffered and in-memory streams always report
+    the count; ``None`` accommodates user-defined writers that signal
+    success without one.  A short write is retried with the remaining
+    bytes; a count that is not an :class:`int`, or is zero, negative, or
+    oversized, raises :exc:`OSError`, because retrying it could loop
+    forever.
+    """
+
+    def write(self, data: bytes, /) -> int | None: ...
 
 
 class AsyncWritable(typing.Protocol):
     """Protocol for asynchronous writable objects (anyio.AsyncFile, etc.).
 
-    ``write()`` returns an awaitable that resolves once the chunk has been
-    accepted; it must consume the whole chunk or raise an exception.
-    Zipwire awaits it before producing more output, so a slow destination
-    applies backpressure to the transfer.
+    ``write()`` returns an awaitable that resolves to the number of bytes
+    accepted or ``None`` when the whole chunk was written.  Zipwire awaits
+    it before producing more output, so a slow destination applies
+    backpressure to the transfer.  Short writes are retried and invalid
+    byte counts raise :exc:`OSError`, as for :class:`Writable`.
 
     The protocol is for static typing only.  Synchronous destinations also
     have a ``write`` attribute, so a runtime ``isinstance()`` check cannot
     tell them apart; zipwire awaits the return value when it is awaitable.
     """
 
-    def write(self, data: bytes, /) -> typing.Awaitable[object]: ...
+    def write(self, data: bytes, /) -> typing.Awaitable[int | None]: ...

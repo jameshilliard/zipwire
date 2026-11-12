@@ -23,16 +23,23 @@ releases; they are marked **BREAKING**.
 - `AsyncRemoteZip` now closes the streamed response deterministically when
   extraction finishes, fails, or is cancelled, instead of relying on async
   generator finalization.
+- **BREAKING:** `read_into()` now retries partial writes and validates
+  what `write()` reports: a zero, negative, oversized, or non-integer
+  byte count raises `OSError`. `Writable.write()` and
+  `AsyncWritable.write()` must return the number of bytes accepted, or
+  `None` to mean that the whole chunk was written. Destinations that
+  return any other value, such as `True` as a success flag, now fail;
+  they must be updated to return a byte count or `None`.
 
 ### Security
 
-- Streaming decompression now yields output in chunks of at most 2 MiB,
-  verifies that compressed streams end cleanly and that the output matches
-  the entry's declared size, and hands control back to the event loop
-  between chunks. Truncated or mismatched output is rejected with the new
-  `TruncatedStream` and `SizeMismatch` exceptions, so a crafted archive
-  can neither force a huge allocation nor make zipwire return damaged
-  data. Credits to James Hilliard for the original implementation.
+- Streaming decompression now yields output in chunks of at most 2 MiB
+  and verifies that compressed streams end cleanly and that the output
+  matches the entry's declared size. Truncated or mismatched output is
+  rejected with the new `TruncatedStream` and `SizeMismatch` exceptions,
+  so a crafted archive can neither force a huge allocation nor make
+  zipwire return damaged data. Credits to James Hilliard for the original
+  implementation.
 
 ### Internal
 

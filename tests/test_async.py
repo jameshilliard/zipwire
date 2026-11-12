@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import io
 import typing
 import zipfile
@@ -283,38 +282,49 @@ class TestAsyncRemoteZip:
         assert bytes(output) == content
         assert max(sizes) <= STREAM_CHUNK_SIZE
 
-    async def test_read_into_yields_to_event_loop(self) -> None:
-        """A synchronous destination must not block the loop between chunks."""
-        content = b"\0" * (3 * STREAM_CHUNK_SIZE)
-        order: list[str] = []
+    def test_read_into_is_loop_agnostic(self) -> None:
+        """read_into must not use event-loop primitives such as asyncio.sleep(0).
 
-        class Destination:
+        A checkpoint like asyncio.sleep(0) passes under asyncio but raises
+        RuntimeError on other event loops such as trio.  Driving the
+        coroutine by hand, with no event loop at all, detects any await
+        that needs one: the extraction must run to completion without ever
+        suspending, for both sync and async destinations.
+        """
+        content = b"\0" * (3 * STREAM_CHUNK_SIZE)
+
+        class SyncDestination:
             def __init__(self) -> None:
                 self.data = bytearray()
 
             def write(self, chunk: bytes) -> int:
-                order.append("write")
                 self.data.extend(chunk)
                 return len(chunk)
 
-        async def observer() -> None:
-            while True:
-                order.append("observer")
-                await asyncio.sleep(0)
+        class AsyncDestination:
+            def __init__(self) -> None:
+                self.data = bytearray()
+
+            async def write(self, chunk: bytes) -> int:
+                self.data.extend(chunk)
+                return len(chunk)
 
         archive_data = make_zip({"entry.bin": content}, compression=zipfile.ZIP_DEFLATED)
-        destination = Destination()
-        async with AsyncRemoteZip(MockAsyncReader(archive_data)) as rz:
-            task = asyncio.create_task(observer())
+        for destination in (SyncDestination(), AsyncDestination()):
+            coroutine = self._extract(archive_data, destination)
             try:
-                await rz.read_into("entry.bin", destination)
-            finally:
-                task.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await task
-        assert bytes(destination.data) == content
-        first_write = order.index("write")
-        assert "observer" in order[first_write:]
+                coroutine.send(None)
+            except StopIteration:
+                pass
+            else:
+                coroutine.close()
+                pytest.fail("read_into suspended on an event-loop primitive")
+            assert bytes(destination.data) == content
+
+    @staticmethod
+    async def _extract(archive_data: bytes, destination: typing.Any) -> None:
+        async with AsyncRemoteZip(MockAsyncReader(archive_data)) as rz:
+            await rz.read_into("entry.bin", destination)
 
     async def test_read_into_closes_stream_on_error(self, large_file_zip: bytes) -> None:
         """Close the response generator when writing fails mid-stream."""

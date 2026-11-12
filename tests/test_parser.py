@@ -324,6 +324,20 @@ class TestParseLocalFileHeader:
         assert header.filename_length == len("hello.txt")
         assert header.data_offset_past_header >= header.filename_length
 
+    def test_filename_extracted(self, stored_zip: bytes) -> None:
+        fn_len = struct.unpack_from("<H", stored_zip, 26)[0]
+        header = parse_local_file_header(stored_zip[: LOCAL_FILE_HEADER_SIZE + fn_len])
+        assert header.filename == b"hello.txt"
+        assert header.filename_length == fn_len
+
+    def test_filename_truncated(self, stored_zip: bytes) -> None:
+        # A buffer that ends inside the filename yields None, not a
+        # partial name.
+        fn_len = struct.unpack_from("<H", stored_zip, 26)[0]
+        header = parse_local_file_header(stored_zip[: LOCAL_FILE_HEADER_SIZE + fn_len - 1])
+        assert header.filename is None
+        assert header.filename_length == fn_len
+
     def test_truncated_header(self) -> None:
         with pytest.raises(BadZipFile, match="truncated"):
             parse_local_file_header(b"\x00" * 10)

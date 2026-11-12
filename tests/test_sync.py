@@ -16,6 +16,7 @@ from zipwire._constants import (
     FLAG_COMPRESSED_PATCHED_DATA,
     FLAG_ENCRYPTED,
     FLAG_STRONG_ENCRYPTION,
+    LOCAL_FILE_HEADER_SIZE,
     STREAM_CHUNK_SIZE,
 )
 from zipwire._errors import (
@@ -444,6 +445,23 @@ def _or_cd_flags(data: bytes, mask: int, index: int = 0) -> bytes:
     return bytes(buf)
 
 
+def _patch_local_filename(data: bytes, index: int, replacement: bytes) -> bytes:
+    """Overwrite the local header filename of central directory entry *index*.
+
+    *replacement* must be the same length as the original filename so
+    the local header layout stays intact.
+    """
+    buf = bytearray(data)
+    header_offset = struct.unpack_from("<I", buf, _cd_entry_offset(data, index) + 42)[0]
+    # Local file header: filename_len is at offset 26, unlike the
+    # central directory entry where it is at 28.
+    fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
+    assert len(replacement) == fn_len
+    start = header_offset + LOCAL_FILE_HEADER_SIZE
+    buf[start : start + fn_len] = replacement
+    return bytes(buf)
+
+
 class ShortTailReader(MockSyncReader):
     """Reader whose first (tail) read_range returns one byte too few."""
 
@@ -468,6 +486,20 @@ class ShortCdReader(MockSyncReader):
     ) -> tuple[bytes, dict[str, str]]:
         data, headers = super().read_range(offset, length)
         if self.read_count == 2:
+            data = data[:-1]
+        return data, headers
+
+
+class ShortFilenameReader(MockSyncReader):
+    """Reader whose fourth (local header filename) read_range is short."""
+
+    def read_range(
+        self,
+        offset: int,
+        length: int,
+    ) -> tuple[bytes, dict[str, str]]:
+        data, headers = super().read_range(offset, length)
+        if self.read_count == 4:
             data = data[:-1]
         return data, headers
 
@@ -544,10 +576,29 @@ class TestHardening:
         ):
             rz.read_into("hello.txt", io.BytesIO())
 
-    def test_shared_local_header_warns(self) -> None:
-        # Two entries pointing at the same local header: zipfile warns
-        # (rather than raising) and still reads the data.
+    def test_shared_local_header_rejected(self) -> None:
+        # Two entries pointing at the same local header under different
+        # names: zipfile raises BadZipFile because the names differ.
         data = make_zip({"one.txt": b"same data", "two.txt": b"same data"})
+        buf = bytearray(data)
+        first_hoff = struct.unpack_from("<I", buf, _cd_entry_offset(data, 0) + 42)[0]
+        struct.pack_into("<I", buf, _cd_entry_offset(data, 1) + 42, first_hoff)
+        reader = MockSyncReader(bytes(buf))
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(BadZipFile, match="differ"),
+        ):
+            rz.read("two.txt")
+
+    def test_shared_local_header_warns(self) -> None:
+        # Two same-named entries pointing at the same local header:
+        # the names match, so zipfile-style reading succeeds and only
+        # the overlap warning fires.
+        zbuf = io.BytesIO()
+        with zipfile.ZipFile(zbuf, "w") as zf:
+            zf.writestr("dup.txt", b"same data")
+            zf.writestr("dup.txt", b"same data")
+        data = zbuf.getvalue()
         buf = bytearray(data)
         first_hoff = struct.unpack_from("<I", buf, _cd_entry_offset(data, 0) + 42)[0]
         struct.pack_into("<I", buf, _cd_entry_offset(data, 1) + 42, first_hoff)
@@ -556,9 +607,98 @@ class TestHardening:
             SyncRemoteZip(reader) as rz,
             pytest.warns(UserWarning, match="Overlapped entries") as caught,
         ):
-            assert rz.read("two.txt") == b"same data"
+            assert rz.read("dup.txt") == b"same data"
         # The warning is attributed to the caller, not to zipwire.
         assert caught[0].filename == __file__
+
+    @pytest.mark.parametrize("method", ["read", "read_into"])
+    def test_local_name_mismatch_rejected(self, stored_zip: bytes, method: str) -> None:
+        # The local header names a different member than the central
+        # directory ("zip confusion").  CPython's zipfile rejects this
+        # in ZipFile.open(), and so does zipwire.
+        corrupted = _patch_local_filename(stored_zip, 0, b"hello.txX")
+        with (
+            zipfile.ZipFile(io.BytesIO(corrupted)) as zf,
+            pytest.raises(zipfile.BadZipFile, match="differ"),
+        ):
+            zf.read("hello.txt")
+        reader = MockSyncReader(corrupted)
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(BadZipFile, match="differ"),
+        ):
+            if method == "read":
+                rz.read("hello.txt")
+            else:
+                rz.read_into("hello.txt", io.BytesIO())
+
+    @pytest.mark.parametrize("method", ["read", "read_into"])
+    def test_local_name_mismatch_large_file(self, large_file_zip: bytes, method: str) -> None:
+        # The large-file path fetches the local header separately from
+        # the compressed data; the name check applies there, too.
+        corrupted = _patch_local_filename(large_file_zip, 0, b"large.bix")
+        reader = MockSyncReader(corrupted)
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(BadZipFile, match="differ"),
+        ):
+            if method == "read":
+                rz.read("large.bin")
+            else:
+                rz.read_into("large.bin", io.BytesIO())
+
+    def test_long_local_name_fetched_for_check(self) -> None:
+        # A local filename longer than the PREFETCH_EXTRA allowance is
+        # not covered by the initial header fetch.  It is fetched with
+        # an extra range request and must still match.
+        name = "l" * 1200 + ".txt"
+        data = make_zip({name: b"long name content"})
+        reader = MockSyncReader(data)
+        with SyncRemoteZip(reader) as rz:
+            assert rz.read(name) == b"long name content"
+        # The prefetch could not cover the filename, so the header fetch
+        # is followed by a request for the filename itself.
+        assert (LOCAL_FILE_HEADER_SIZE, len(name)) in reader.requests
+
+    def test_long_local_name_mismatch_rejected(self) -> None:
+        # A mismatching local filename must not slip past the check just
+        # because it is longer than the prefetch allowance.
+        name = "l" * 1200 + ".txt"
+        data = make_zip({name: b"long name content"})
+        corrupted = _patch_local_filename(data, 0, ("L" + name[1:]).encode())
+        reader = MockSyncReader(corrupted)
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(BadZipFile, match="differ"),
+        ):
+            rz.read(name)
+
+    def test_lying_local_filename_length_rejected(self, stored_zip: bytes) -> None:
+        # A local header that claims a huge filename shifts the data
+        # offset past the archive end; the bounds check rejects it
+        # before any filename fetch happens.
+        buf = bytearray(stored_zip)
+        # Local file header filename_len field (offset 26).
+        struct.pack_into("<H", buf, LOCAL_FILE_HEADER_SIZE - 4, 0xFFFF)
+        reader = MockSyncReader(bytes(buf))
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(BadZipFile, match="beyond the end"),
+        ):
+            rz.read("hello.txt")
+
+    def test_unicode_local_name_mismatch_rejected(self, unicode_zip: bytes) -> None:
+        # For entries with the UTF-8 flag set, the central directory
+        # name is re-encoded as UTF-8 for the comparison.
+        name = "éàü.txt"
+        encoded = name.encode("utf-8")
+        corrupted = _patch_local_filename(unicode_zip, 0, b"x" + encoded[1:])
+        reader = MockSyncReader(corrupted)
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(BadZipFile, match="differ"),
+        ):
+            rz.read(name)
 
     def test_cd_bounds_checked_before_fetch(self, stored_zip: bytes) -> None:
         # A hostile cd_size must not become a range request: only the
@@ -614,3 +754,15 @@ class TestHardening:
             SyncRemoteZip(reader),
         ):
             pass
+
+    def test_short_local_filename_fetch_rejected(self) -> None:
+        # The extra fetch for a filename longer than the prefetch
+        # allowance must return every byte it asked for.
+        name = "l" * 1200 + ".txt"
+        data = make_zip({name: b"long name content"})
+        reader = ShortFilenameReader(data)
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(BadZipFile, match="filename fetch returned"),
+        ):
+            rz.read(name)

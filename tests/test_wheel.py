@@ -10,7 +10,7 @@ import pytest
 
 from tests.conftest import MockAsyncReader, MockSyncReader
 from zipwire import AsyncRemoteWheel, SyncRemoteWheel
-from zipwire._constants import CENTRAL_DIR_SIZE, FLAG_ENCRYPTED
+from zipwire._constants import CENTRAL_DIR_SIZE, FLAG_ENCRYPTED, LOCAL_FILE_HEADER_SIZE
 from zipwire._errors import BadZipFile, UnsupportedFeature
 from zipwire._parser import find_eocd
 from zipwire._wheel import _dist_info_from_url
@@ -315,6 +315,30 @@ def _inflate_last_cd_compress_size(data: bytes, delta: int) -> bytes:
     return bytes(buf)
 
 
+def _last_local_header_offset(data: bytes) -> int:
+    """Absolute offset of the last entry's local file header in *data*."""
+    return struct.unpack_from("<I", data, _last_cd_entry_offset(data) + 42)[0]
+
+
+def _flip_last_local_filename_byte(data: bytes) -> bytes:
+    """Flip the last byte of the last entry's local header filename."""
+    buf = bytearray(data)
+    header_offset = _last_local_header_offset(data)
+    # Local file header: filename_len is at offset 26.
+    fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
+    pos = header_offset + LOCAL_FILE_HEADER_SIZE + fn_len - 1
+    buf[pos] ^= 1
+    return bytes(buf)
+
+
+def _set_last_local_filename_length(data: bytes, fn_len: int) -> bytes:
+    """Overwrite the last entry's local header filename_len field."""
+    buf = bytearray(data)
+    header_offset = _last_local_header_offset(data)
+    struct.pack_into("<H", buf, header_offset + 26, fn_len)
+    return bytes(buf)
+
+
 class TestWheelHardening:
     """The wheel tail-buffer fast path applies the same entry checks."""
 
@@ -365,3 +389,39 @@ class TestWheelHardening:
         async with AsyncRemoteWheel(reader) as whl:
             with pytest.raises(BadZipFile, match="Overlapped entries"):
                 await whl.read(f"{whl.dist_info_dir}RECORD")
+
+    def test_local_name_mismatch_rejected(self) -> None:
+        """A tail-served entry whose local header name differs is rejected."""
+        # Enough entries for a >1 KiB central directory, so RECORD (the
+        # last file) is covered by the tail fast path.
+        extra_files = {f"mod{i}.py": b"x = 1\n" for i in range(15)}
+        data, filename = _make_wheel(extra_files=extra_files)
+        corrupted = _flip_last_local_filename_byte(data)
+        reader = MockSyncReader(corrupted, url=f"https://example.com/{filename}")
+        with (
+            SyncRemoteWheel(reader) as whl,
+            pytest.raises(BadZipFile, match="differ"),
+        ):
+            whl.read(f"{whl.dist_info_dir}RECORD")
+
+    def test_lying_local_filename_length_rejected(self) -> None:
+        """A local header that claims a huge filename falls back from the
+        tail fast path and is rejected by the regular bounds check."""
+        extra_files = {f"mod{i}.py": b"x = 1\n" for i in range(15)}
+        data, filename = _make_wheel(extra_files=extra_files)
+        corrupted = _set_last_local_filename_length(data, 0xFFFF)
+        reader = MockSyncReader(corrupted, url=f"https://example.com/{filename}")
+        with (
+            SyncRemoteWheel(reader) as whl,
+            pytest.raises(BadZipFile, match="beyond the end"),
+        ):
+            whl.read(f"{whl.dist_info_dir}RECORD")
+
+    def test_long_dist_info_name_checked(self) -> None:
+        """A dist-info name longer than the tail allowance is still
+        validated and read correctly from the tail buffer."""
+        data, filename = _make_wheel(name="a" * 1100)
+        reader = MockSyncReader(data, url=f"https://example.com/{filename}")
+        with SyncRemoteWheel(reader) as whl:
+            metadata = whl.read(whl.metadata_name)
+        assert b"Name:" in metadata

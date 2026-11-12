@@ -122,6 +122,9 @@ class _RemoteWheelMixin:
     ) -> tuple[RemoteZipInfo, int, bytes] | None:
         """Try to resolve an entry's compressed data from the tail buffer.
 
+        The local file header's filename is validated against the
+        central directory name, as ``zipfile.ZipFile.open()`` does.
+
         Returns ``(info, data_offset, compressed)`` if the entry fits
         entirely within the tail, otherwise ``None``.
         """
@@ -133,10 +136,16 @@ class _RemoteWheelMixin:
         rel = info.header_offset - tail_start
         local_header = parse_local_file_header(self._tail_data[rel:])
         data_start = rel + LOCAL_FILE_HEADER_SIZE + local_header.data_offset_past_header
+        if data_start + info.compress_size > len(self._tail_data):
+            # Rare: the local header's variable fields exceeded the
+            # PREFETCH_EXTRA allowance, so the compressed data is not
+            # fully covered by the tail.  Use the regular resolve path.
+            return None
         data_offset = (
             info.header_offset + LOCAL_FILE_HEADER_SIZE + local_header.data_offset_past_header
         )
         self._validate_data_region(info, data_offset)  # type: ignore[attr-defined]
+        self._check_local_filename(info, local_header.filename)  # type: ignore[attr-defined]
         compressed = self._tail_data[data_start : data_start + info.compress_size]
         return info, data_offset, compressed
 

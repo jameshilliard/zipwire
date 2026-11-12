@@ -13,7 +13,7 @@ from zipwire._constants import (
 )
 from zipwire._decompress import StreamingDecompressor, adecompress
 from zipwire._errors import BadZipFile, FileTooLarge, RangeRequestUnsupported
-from zipwire._parser import find_eocd, parse_local_file_header
+from zipwire._parser import LocalHeaderInfo, find_eocd, parse_local_file_header
 from zipwire._write import awrite_all
 from zipwire._zipinfo import RemoteZipInfo
 
@@ -106,6 +106,9 @@ class AsyncRemoteZip(RemoteZipBase):
     ) -> tuple[RemoteZipInfo, int, bytes | None] | None:
         """Resolve *name* to a ZipInfo and compute the compressed data offset.
 
+        The local file header's filename is validated against the
+        central directory name, as ``zipfile.ZipFile.open()`` does.
+
         Returns ``None`` for directory entries (no data to extract),
         or ``(info, data_offset, prefetched)`` for file entries.
         For small files (compressed size <= 50 KiB) the local header and
@@ -129,17 +132,53 @@ class AsyncRemoteZip(RemoteZipBase):
             data_offset = info.header_offset + data_start
             if data_start + info.compress_size <= len(buf):
                 self._validate_data_region(info, data_offset)
+                self._check_local_filename(info, local_header.filename)
                 return info, data_offset, buf[data_start : data_start + info.compress_size]
             # Rare: variable fields exceeded PREFETCH_EXTRA, fall through
         else:
-            buf, _ = await self._reader.read_range(info.header_offset, LOCAL_FILE_HEADER_SIZE)
+            # Large file: fetch the header plus an allowance for its
+            # variable fields so the filename can be validated; the
+            # compressed data is fetched or streamed separately.
+            fetch_size = min(
+                LOCAL_FILE_HEADER_SIZE + PREFETCH_EXTRA,
+                self.file_size - info.header_offset,
+            )
+            buf, _ = await self._reader.read_range(info.header_offset, fetch_size)
             local_header = parse_local_file_header(buf)
             data_offset = (
                 info.header_offset + LOCAL_FILE_HEADER_SIZE + local_header.data_offset_past_header
             )
 
         self._validate_data_region(info, data_offset)
+        self._check_local_filename(info, await self._fetch_local_filename(info, local_header))
         return info, data_offset, None
+
+    async def _fetch_local_filename(
+        self,
+        info: RemoteZipInfo,
+        local_header: LocalHeaderInfo,
+    ) -> bytes | None:
+        """Return the raw local filename, fetching it if it was not prefetched.
+
+        ``_validate_data_region()`` must have passed for *info* first:
+        it bounds the local header's filename length by the archive
+        end, so the fetch here cannot go past it.
+
+        Raises:
+            BadZipFile: If the fetch returns fewer bytes than the local
+                header's filename length.
+        """
+        if local_header.filename is not None:
+            return local_header.filename
+        # Rare: the local filename exceeds the PREFETCH_EXTRA allowance.
+        offset = info.header_offset + LOCAL_FILE_HEADER_SIZE
+        filename, _ = await self._reader.read_range(offset, local_header.filename_length)
+        if len(filename) != local_header.filename_length:
+            raise BadZipFile(
+                f"{info.filename!r}: local header filename fetch returned "
+                f"{len(filename)} of {local_header.filename_length} bytes"
+            )
+        return filename
 
     async def read(
         self,
@@ -167,7 +206,10 @@ class AsyncRemoteZip(RemoteZipBase):
             depth: it enforces the size limit during decompression.
             A truncated stream raises :exc:`~zipwire.TruncatedStream`,
             and a decompressed size that differs from the declared
-            ``file_size`` raises :exc:`~zipwire.SizeMismatch`.
+            ``file_size`` raises :exc:`~zipwire.SizeMismatch`.  A local
+            file header whose filename differs from the central
+            directory name raises :exc:`~zipwire.BadZipFile`, as
+            ``zipfile.ZipFile.open()`` does.
         """
         resolved = await self._resolve_entry(name)
         if resolved is None:
@@ -233,6 +275,10 @@ class AsyncRemoteZip(RemoteZipBase):
         commit it.  Errors and cancellation may leave partial output; only
         a successful return indicates that the stream ended cleanly and
         the CRC-32 and size checks passed.
+
+        A local file header whose filename differs from the central
+        directory name raises :exc:`~zipwire.BadZipFile`, as
+        ``zipfile.ZipFile.open()`` does.
 
         .. versionchanged:: 0.5.0
 

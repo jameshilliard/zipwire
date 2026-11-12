@@ -11,7 +11,12 @@ import pytest
 
 from tests.conftest import MockAsyncReader, make_zip
 from zipwire import AsyncRemoteZip, EOCDInfo
-from zipwire._constants import FLAG_COMPRESSED_PATCHED_DATA, FLAG_ENCRYPTED, STREAM_CHUNK_SIZE
+from zipwire._constants import (
+    FLAG_COMPRESSED_PATCHED_DATA,
+    FLAG_ENCRYPTED,
+    LOCAL_FILE_HEADER_SIZE,
+    STREAM_CHUNK_SIZE,
+)
 from zipwire._errors import (
     BadZipFile,
     FileNotFoundInZip,
@@ -455,8 +460,66 @@ class ShortTailAsyncReader(MockAsyncReader):
         return data, headers
 
 
+class ShortFilenameAsyncReader(MockAsyncReader):
+    """Reader whose fourth (local header filename) read_range is short."""
+
+    async def read_range(
+        self,
+        offset: int,
+        length: int,
+    ) -> tuple[bytes, dict[str, str]]:
+        data, headers = await super().read_range(offset, length)
+        if self.read_count == 4:
+            data = data[:-1]
+        return data, headers
+
+
 class TestHardening:
     """Admission and bounds checks ported from zipfile (async path)."""
+
+    @pytest.mark.parametrize("method", ["read", "read_into"])
+    async def test_local_name_mismatch_rejected(self, stored_zip: bytes, method: str) -> None:
+        # The local header names a different member than the central
+        # directory ("zip confusion"); rejected like zipfile does.
+        buf = bytearray(stored_zip)
+        eocd = find_eocd(stored_zip, len(stored_zip))
+        header_offset = struct.unpack_from("<I", buf, eocd.cd_offset + 42)[0]
+        # Local file header: filename_len is at offset 26.
+        fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
+        start = header_offset + LOCAL_FILE_HEADER_SIZE
+        buf[start : start + fn_len] = b"hello.txX"
+        reader = MockAsyncReader(bytes(buf))
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(BadZipFile, match="differ"):
+                if method == "read":
+                    await rz.read("hello.txt")
+                else:
+                    await rz.read_into("hello.txt", io.BytesIO())
+
+    async def test_long_local_name_fetched_for_check(self) -> None:
+        # A local filename longer than the PREFETCH_EXTRA allowance is
+        # fetched with an extra range request and must still match.
+        name = "l" * 1200 + ".txt"
+        data = make_zip({name: b"long name content"})
+        reader = MockAsyncReader(data)
+        async with AsyncRemoteZip(reader) as rz:
+            assert await rz.read(name) == b"long name content"
+        assert (LOCAL_FILE_HEADER_SIZE, len(name)) in reader.requests
+
+    async def test_long_local_name_mismatch_rejected(self) -> None:
+        # A mismatching local filename must not slip past the check just
+        # because it is longer than the prefetch allowance.
+        name = "l" * 1200 + ".txt"
+        data = make_zip({name: b"long name content"})
+        buf = bytearray(data)
+        header_offset = 0
+        fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
+        start = header_offset + LOCAL_FILE_HEADER_SIZE
+        buf[start : start + fn_len] = ("L" + name[1:]).encode()
+        reader = MockAsyncReader(bytes(buf))
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(BadZipFile, match="differ"):
+                await rz.read(name)
 
     async def test_encrypted_entry_rejected(self, stored_zip: bytes) -> None:
         buf = bytearray(stored_zip)
@@ -532,3 +595,13 @@ class TestHardening:
         with pytest.raises(BadZipFile, match="tail fetch returned"):
             async with AsyncRemoteZip(reader):
                 pass
+
+    async def test_short_local_filename_fetch_rejected(self) -> None:
+        # The extra fetch for a filename longer than the prefetch
+        # allowance must return every byte it asked for.
+        name = "l" * 1200 + ".txt"
+        data = make_zip({name: b"long name content"})
+        reader = ShortFilenameAsyncReader(data)
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(BadZipFile, match="filename fetch returned"):
+                await rz.read(name)

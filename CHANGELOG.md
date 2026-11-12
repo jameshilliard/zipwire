@@ -33,6 +33,13 @@ releases; they are marked **BREAKING**.
   ignored, as in CPython), and corrupt ZIP64 records, locators, and
   extra fields are rejected instead of being silently ignored or
   misparsed.
+- The local file header's filename is now compared against the central
+  directory name when an entry is read, as CPython's `zipfile` does in
+  `ZipFile.open()`. An archive whose local header names a different
+  member than the central directory, crafted so that scanners and
+  extractors disagree about member names, is rejected with
+  `BadZipFile`. The check covers the sync and async readers and the
+  wheel tail fast path.
 
 ### Changed
 

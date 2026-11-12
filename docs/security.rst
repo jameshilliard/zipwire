@@ -82,6 +82,22 @@ filenames from the archive to construct file paths, always sanitise them:
                print(f"Skipping path traversal: {info.filename}")
                continue
 
+Local header inconsistencies
+----------------------------
+
+Every ZIP entry is described twice: in the central directory and in
+the local file header that precedes the file data.  A crafted archive
+can name a different member in the two places, so tools that read the
+local header (many extractors and scanners) disagree with tools that
+read the central directory about what the archive contains.  This
+matters for supply-chain workflows such as wheel inspection even
+though zipwire never writes files to disk.
+
+When an entry is read, zipwire compares the local header's filename
+against the central directory name, like CPython's ``zipfile`` does in
+``ZipFile.open()``, and raises :exc:`~zipwire.BadZipFile` when they
+differ.
+
 Server trust
 ------------
 

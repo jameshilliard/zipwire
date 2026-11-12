@@ -10,6 +10,7 @@ from zipwire._constants import (
     FLAG_COMPRESSED_PATCHED_DATA,
     FLAG_ENCRYPTED,
     FLAG_STRONG_ENCRYPTION,
+    FLAG_UTF8_FILENAME,
     LOCAL_FILE_HEADER_SIZE,
     MAX_EOCD_SEARCH,
 )
@@ -157,6 +158,32 @@ class RemoteZipBase:
                     warnings.warn(message, stacklevel=4)
             else:
                 raise BadZipFile(f"Overlapped entries: {info.filename!r} (possible zip bomb)")
+
+    def _check_local_filename(self, info: RemoteZipInfo, local_filename: bytes | None) -> None:
+        """Compare the local file header name with the central directory name.
+
+        Like ``zipfile.ZipFile.open()``, the raw filename bytes from the
+        local header are compared against the central directory name
+        encoded with the central directory's UTF-8 flag.  A mismatch
+        means the archive was crafted so that tools reading the local
+        header see a different member name than the central directory
+        reports.
+
+        Raises:
+            BadZipFile: If the names differ or the local filename bytes
+                are missing.
+        """
+        if local_filename is None:
+            raise BadZipFile(f"{info.filename!r}: local file header filename is truncated")
+        if info.flag_bits & FLAG_UTF8_FILENAME:
+            expected = info.orig_filename.encode("utf-8")
+        else:
+            expected = info.orig_filename.encode("cp437")
+        if local_filename != expected:
+            raise BadZipFile(
+                f"File name in directory {info.orig_filename!r} and "
+                f"header {local_filename!r} differ."
+            )
 
     @property
     def file_size(self) -> int:

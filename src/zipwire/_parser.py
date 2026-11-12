@@ -61,10 +61,15 @@ class CentralDirEntry:
 
 @dataclass(frozen=True, slots=True)
 class LocalHeaderInfo:
-    """Parsed local file header - just enough to find the data offset."""
+    """Parsed local file header - just enough to find the data offset.
+
+    *filename* holds the raw filename bytes when *data* contained all
+    of them and ``None`` when it ended inside the filename.
+    """
 
     filename_length: int
     extra_length: int
+    filename: bytes | None
 
     @property
     def data_offset_past_header(self) -> int:
@@ -272,10 +277,13 @@ def parse_local_file_header(data: bytes) -> LocalHeaderInfo:
     """Parse a local file header to determine the data offset.
 
     Args:
-        data: At least LOCAL_FILE_HEADER_SIZE bytes of the local header.
+        data: At least LOCAL_FILE_HEADER_SIZE bytes of the local
+            header.  The raw filename is extracted when *data* also
+            contains all ``filename_length`` bytes of it.
 
     Returns:
-        LocalHeaderInfo with filename and extra field lengths.
+        LocalHeaderInfo with the filename and extra field lengths and
+        the raw filename bytes when they are contained in *data*.
 
     Raises:
         BadZipFile: If the header is invalid.
@@ -291,7 +299,15 @@ def parse_local_file_header(data: bytes) -> LocalHeaderInfo:
     if fields[0] != LOCAL_FILE_HEADER_SIGNATURE:
         raise BadZipFile("Invalid local file header signature")
 
+    filename_length = fields[9]
+    filename_end = LOCAL_FILE_HEADER_SIZE + filename_length
+    if filename_end <= len(data):
+        filename: bytes | None = data[LOCAL_FILE_HEADER_SIZE:filename_end]
+    else:
+        filename = None
+
     return LocalHeaderInfo(
-        filename_length=fields[9],
+        filename_length=filename_length,
         extra_length=fields[10],
+        filename=filename,
     )

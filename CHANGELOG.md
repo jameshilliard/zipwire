@@ -10,6 +10,24 @@ releases; they are marked **BREAKING**.
 
 ### Added
 
+- `EOCDInfo` now carries the .ZIP file comment in a new `comment`
+  field. For archives with ZIP64 end records the comment comes from
+  the classic record, which is the only one that has it.
+
+### Internal
+
+- The library and test suite are now type checked with pyrefly and mypy,
+  and type annotations were completed and improved throughout.
+- Replaced the hand-rolled EOCD, central directory, and local file header
+  unpacking with the declarative record types in `zipwire._zipstructs`.
+  `zipwire._constants` now holds only the integer bounds, fetch sizes,
+  and compression methods; record signatures, struct formats, and fixed
+  sizes are derived by the records themselves.
+
+## 0.5.0 - 2026-11-12
+
+### Added
+
 - `AsyncRemoteZip.read_into()` accepts asynchronous writable objects
   implementing the new `AsyncWritable` protocol, such as `anyio.AsyncFile`.
   If `write()` returns an awaitable, zipwire awaits it before reading more
@@ -19,9 +37,6 @@ releases; they are marked **BREAKING**.
   strong encryption (bit 6) are now rejected up front instead of feeding
   unusable data to the decompressor and failing with a confusing CRC or
   size error.
-- `EOCDInfo` now carries the .ZIP file comment in a new `comment`
-  field. For archives with ZIP64 end records the comment comes from
-  the classic record, which is the only one that has it.
 
 ### Security
 
@@ -85,17 +100,10 @@ releases; they are marked **BREAKING**.
 
 ### Internal
 
-- The library and test suite are now type checked with pyrefly and mypy,
-  and type annotations were completed and improved throughout.
 - `StreamingDecompressor` no longer writes to a destination; `feed()`
   returns decompressed bytes and `finish()` verifies that the stream ended
   cleanly and checks the CRC-32 and expected size without returning data,
   so the sync and async `read_into()` paths share these checks.
-- Replaced the hand-rolled EOCD, central directory, and local file header
-  unpacking with the declarative record types in `zipwire._zipstructs`.
-  `zipwire._constants` now holds only the integer bounds, fetch sizes,
-  and compression methods; record signatures, struct formats, and fixed
-  sizes are derived by the records themselves.
 
 ## 0.4.0 - 2026-08-29
 

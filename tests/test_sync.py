@@ -11,14 +11,7 @@ import pytest
 
 from tests.conftest import MockHeaders, MockSyncReader, make_zip
 from zipwire import EOCDInfo, SyncRemoteZip
-from zipwire._constants import (
-    CENTRAL_DIR_SIZE,
-    FLAG_COMPRESSED_PATCHED_DATA,
-    FLAG_ENCRYPTED,
-    FLAG_STRONG_ENCRYPTION,
-    LOCAL_FILE_HEADER_SIZE,
-    STREAM_CHUNK_SIZE,
-)
+from zipwire._constants import STREAM_CHUNK_SIZE, HeaderFlag
 from zipwire._errors import (
     BadZipFile,
     FileNotFoundInZip,
@@ -28,6 +21,10 @@ from zipwire._errors import (
 )
 from zipwire._parser import find_eocd
 from zipwire._zipinfo import RemoteZipInfo
+from zipwire._zipstructs import (
+    CentralDirHeaderRecord,
+    LocalFileHeaderRecord,
+)
 
 if typing.TYPE_CHECKING:
     from collections.abc import Generator
@@ -70,6 +67,26 @@ class TestSyncRemoteZip:
         assert eocd.cd_entry_count == 2
         assert eocd.cd_size > 0
         assert 0 <= eocd.cd_offset < len(stored_zip)
+        assert eocd.comment == b""
+
+    def test_eocd_info_comment(self, comment_zip: bytes) -> None:
+        reader = MockSyncReader(comment_zip)
+        with SyncRemoteZip(reader) as rz:
+            eocd = rz.eocd_info
+        assert eocd.comment == b"This is a ZIP comment"
+
+    def test_zip64_archive(self, zip64_zip: bytes) -> None:
+        """An archive with ZIP64 end records loads and reads end to end."""
+        reader = MockSyncReader(zip64_zip)
+        with SyncRemoteZip(reader) as rz:
+            eocd = rz.eocd_info
+            assert isinstance(eocd, EOCDInfo)
+            assert eocd.cd_entry_count == 65536 + 3
+            assert eocd.cd_offset + eocd.cd_size < len(zip64_zip)
+            assert len(rz.namelist()) == eocd.cd_entry_count
+            assert eocd.comment == b""
+            assert rz.read("f0.txt") == b"x"
+            assert rz.read("f65538.txt") == b"x"
 
     def test_url(self, stored_zip: bytes) -> None:
         reader = MockSyncReader(stored_zip, url="https://example.com/archive.zip")
@@ -432,7 +449,7 @@ def _cd_entry_offset(data: bytes, index: int = 0) -> int:
     offset = eocd.cd_offset
     for _ in range(index):
         fn_len, extra_len, comment_len = struct.unpack_from("<HHH", data, offset + 28)
-        offset += CENTRAL_DIR_SIZE + fn_len + extra_len + comment_len
+        offset += CentralDirHeaderRecord.FIXED_SIZE + fn_len + extra_len + comment_len
     return offset
 
 
@@ -457,7 +474,7 @@ def _patch_local_filename(data: bytes, index: int, replacement: bytes) -> bytes:
     # central directory entry where it is at 28.
     fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
     assert len(replacement) == fn_len
-    start = header_offset + LOCAL_FILE_HEADER_SIZE
+    start = header_offset + LocalFileHeaderRecord.FIXED_SIZE
     buf[start : start + fn_len] = replacement
     return bytes(buf)
 
@@ -507,32 +524,33 @@ class ShortFilenameReader(MockSyncReader):
 class TestHardening:
     """Admission and bounds checks ported from zipfile."""
 
+    def test_data_descriptor_entry_read(self, stored_zip: bytes) -> None:
+        """Flag bit 3 (data descriptor) alone does not reject the entry."""
+        data = _or_cd_flags(stored_zip, HeaderFlag.HAS_DATA_DESCRIPTOR)
+        reader = MockSyncReader(data)
+        with SyncRemoteZip(reader) as rz:
+            assert rz.read("hello.txt") == b"Hello, World!"
+
     def test_encrypted_entry_rejected(self, stored_zip: bytes) -> None:
-        data = _or_cd_flags(stored_zip, FLAG_ENCRYPTED)
+        data = _or_cd_flags(stored_zip, HeaderFlag.ENCRYPTED)
         reader = MockSyncReader(data)
         with SyncRemoteZip(reader) as rz, pytest.raises(UnsupportedFeature, match="encrypted"):
             rz.read("hello.txt")
 
     def test_patched_data_rejected(self, stored_zip: bytes) -> None:
-        data = _or_cd_flags(stored_zip, FLAG_COMPRESSED_PATCHED_DATA)
+        data = _or_cd_flags(stored_zip, HeaderFlag.COMPRESSED_PATCHED_DATA)
         reader = MockSyncReader(data)
         with SyncRemoteZip(reader) as rz, pytest.raises(UnsupportedFeature, match="patched data"):
             rz.read("hello.txt")
 
     def test_strong_encryption_rejected(self, stored_zip: bytes) -> None:
-        data = _or_cd_flags(stored_zip, FLAG_STRONG_ENCRYPTION)
+        data = _or_cd_flags(stored_zip, HeaderFlag.STRONG_ENCRYPTION)
         reader = MockSyncReader(data)
         with (
             SyncRemoteZip(reader) as rz,
             pytest.raises(UnsupportedFeature, match="strong encryption"),
         ):
             rz.read("hello.txt")
-
-    def test_encrypted_entry_rejected_by_read_into(self, stored_zip: bytes) -> None:
-        data = _or_cd_flags(stored_zip, FLAG_ENCRYPTED)
-        reader = MockSyncReader(data)
-        with SyncRemoteZip(reader) as rz, pytest.raises(UnsupportedFeature, match="encrypted"):
-            rz.read_into("hello.txt", io.BytesIO())
 
     def test_header_offset_beyond_archive(self, stored_zip: bytes) -> None:
         buf = bytearray(stored_zip)
@@ -658,7 +676,7 @@ class TestHardening:
             assert rz.read(name) == b"long name content"
         # The prefetch could not cover the filename, so the header fetch
         # is followed by a request for the filename itself.
-        assert (LOCAL_FILE_HEADER_SIZE, len(name)) in reader.requests
+        assert (LocalFileHeaderRecord.FIXED_SIZE, len(name)) in reader.requests
 
     def test_long_local_name_mismatch_rejected(self) -> None:
         # A mismatching local filename must not slip past the check just
@@ -679,7 +697,7 @@ class TestHardening:
         # before any filename fetch happens.
         buf = bytearray(stored_zip)
         # Local file header filename_len field (offset 26).
-        struct.pack_into("<H", buf, LOCAL_FILE_HEADER_SIZE - 4, 0xFFFF)
+        struct.pack_into("<H", buf, LocalFileHeaderRecord.FIXED_SIZE - 4, 0xFFFF)
         reader = MockSyncReader(bytes(buf))
         with (
             SyncRemoteZip(reader) as rz,

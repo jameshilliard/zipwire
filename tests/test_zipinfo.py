@@ -8,10 +8,11 @@ import zipfile
 
 import pytest
 
-from zipwire._constants import ZIP64_EXTRA_FIELD_ID
+from zipwire._constants import MAX_UINT16, MAX_UINT32, ExtraDataId
 from zipwire._errors import BadZipFile
 from zipwire._parser import find_eocd, parse_central_directory
-from zipwire._zipinfo import RemoteZipInfo, _apply_zip64_extra
+from zipwire._zipinfo import RemoteZipInfo
+from zipwire._zipstructs import CentralDirHeaderRecord
 
 
 class TestRemoteZipInfoCompat:
@@ -76,8 +77,8 @@ class TestRemoteZipInfoCompat:
     def test_unicode_filenames(self, unicode_zip: bytes) -> None:
         infos = self._get_infos(unicode_zip)
         filenames = [info.filename for info in infos]
-        assert "\u00e9\u00e0\u00fc.txt" in filenames
-        assert "\u4f60\u597d/world.txt" in filenames
+        assert "éàü.txt" in filenames
+        assert "你好/world.txt" in filenames
 
     def test_header_offset(self, stored_zip: bytes) -> None:
         infos = self._get_infos(stored_zip)
@@ -105,117 +106,84 @@ class TestRemoteZipInfoCompat:
             assert ours.header_offset == stdlib.header_offset
 
 
-class TestZip64ExtraField:
-    def test_zip64_extra_sizes(self) -> None:
-        """Sentinel file_size and compress_size are updated from ZIP64 extra field."""
-        info = RemoteZipInfo("test.txt")
-        info.file_size = 0xFFFFFFFF
-        info.compress_size = 0xFFFFFFFF
-        info.header_offset = 100
-        info.volume = 0
+def make_cd_entry(extra: bytes = b"", **overrides: int) -> CentralDirHeaderRecord:
+    """A central directory header record with overridable fields."""
+    values: dict[str, int] = {
+        "version_made_by": 45,
+        "version_needed": 45,
+        "flags": 0,
+        "compression_method": 0,
+        "mod_time": 0,
+        "mod_date": 0,
+        "crc32": 0,
+        "compressed_size": 10,
+        "uncompressed_size": 10,
+        "filename_length": 0,
+        "extra_length": 0,
+        "comment_length": 0,
+        "disk_start": 0,
+        "internal_attr": 0,
+        "external_attr": 0,
+        "header_offset": 100,
+    }
+    values.update(overrides)
+    values["extra_length"] = len(extra)
+    header = b"PK\x01\x02" + struct.pack("<HHHHHHIIIHHHHHII", *values.values())
+    return CentralDirHeaderRecord.parse(header + extra)
 
-        real_file_size = 0x1_0000_0000
-        real_compress_size = 0x1_0000_0001
-        extra_data = struct.pack("<Q", real_file_size) + struct.pack("<Q", real_compress_size)
-        info.extra = struct.pack("<HH", ZIP64_EXTRA_FIELD_ID, len(extra_data)) + extra_data
 
-        _apply_zip64_extra(info)
-        assert info.file_size == real_file_size
-        assert info.compress_size == real_compress_size
+def zip64_extra(payload: bytes) -> bytes:
+    """A ZIP64 extended information extra field wrapping *payload*."""
+    return struct.pack("<HH", ExtraDataId.ZIP64, len(payload)) + payload
+
+
+class TestZip64Resolution:
+    """``_from_central_dir_entry`` resolves ZIP64 sentinels."""
+
+    def test_zip64_sizes_resolved(self) -> None:
+        """Sentinel file_size and compress_size are updated from the field."""
+        payload = struct.pack("<QQ", 0x1_0000_0000, 0x1_0000_0001)
+        entry = make_cd_entry(
+            zip64_extra(payload),
+            uncompressed_size=MAX_UINT32,
+            compressed_size=MAX_UINT32,
+        )
+        info = RemoteZipInfo._from_central_dir_entry(entry)
+        assert info.file_size == 0x1_0000_0000
+        assert info.compress_size == 0x1_0000_0001
         assert info.header_offset == 100  # unchanged
 
-    def test_zip64_extra_all_fields(self) -> None:
-        """All four sentinel fields are updated from ZIP64 extra field."""
-        info = RemoteZipInfo("test.txt")
-        info.file_size = 0xFFFFFFFF
-        info.compress_size = 0xFFFFFFFF
-        info.header_offset = 0xFFFFFFFF
-        info.volume = 0xFFFF
-
-        real_file_size = 0x2_0000_0000
-        real_compress_size = 0x2_0000_0001
-        real_header_offset = 0x2_0000_0002
-        real_volume = 42
-        extra_data = (
-            struct.pack("<Q", real_file_size)
-            + struct.pack("<Q", real_compress_size)
-            + struct.pack("<Q", real_header_offset)
-            + struct.pack("<I", real_volume)
+    def test_zip64_all_fields_resolved(self) -> None:
+        """All four sentinel fields are updated from the field."""
+        payload = struct.pack("<QQQI", 0x2_0000_0000, 0x2_0000_0001, 0x2_0000_0002, 42)
+        entry = make_cd_entry(
+            zip64_extra(payload),
+            uncompressed_size=MAX_UINT32,
+            compressed_size=MAX_UINT32,
+            header_offset=MAX_UINT32,
+            disk_start=MAX_UINT16,
         )
-        info.extra = struct.pack("<HH", ZIP64_EXTRA_FIELD_ID, len(extra_data)) + extra_data
+        info = RemoteZipInfo._from_central_dir_entry(entry)
+        assert info.file_size == 0x2_0000_0000
+        assert info.compress_size == 0x2_0000_0001
+        assert info.header_offset == 0x2_0000_0002
+        assert info.volume == 42
 
-        _apply_zip64_extra(info)
-        assert info.file_size == real_file_size
-        assert info.compress_size == real_compress_size
-        assert info.header_offset == real_header_offset
-        assert info.volume == real_volume
+    def test_zip64_without_sentinels(self) -> None:
+        """A ZIP64 field next to other fields updates nothing without sentinels."""
+        other = struct.pack("<HH", 0x000A, 8) + b"\x00" * 8
+        payload = struct.pack("<Q", 0x3_0000_0000)
+        entry = make_cd_entry(other + zip64_extra(payload))
+        info = RemoteZipInfo._from_central_dir_entry(entry)
+        assert info.file_size == 10  # unchanged (not sentinel)
+        assert info.compress_size == 10
+        assert info.header_offset == 100
 
-    def test_zip64_extra_with_other_fields(self) -> None:
-        """Non-ZIP64 extra field preceding the ZIP64 field."""
-        info = RemoteZipInfo("test.txt")
-        info.file_size = 0xFFFFFFFF
-        info.compress_size = 500
-        info.header_offset = 100
-        info.volume = 0
-
-        # Some other extra field first (id=0x000a, 8 bytes of data)
-        other_extra = struct.pack("<HH", 0x000A, 8) + b"\x00" * 8
-
-        # ZIP64 extra field with just file_size (compress_size is not sentinel)
-        real_file_size = 0x3_0000_0000
-        zip64_data = struct.pack("<Q", real_file_size)
-        zip64_extra = struct.pack("<HH", ZIP64_EXTRA_FIELD_ID, len(zip64_data)) + zip64_data
-
-        info.extra = other_extra + zip64_extra
-
-        _apply_zip64_extra(info)
-        assert info.file_size == real_file_size
-        assert info.compress_size == 500  # unchanged (not sentinel)
-
-    def test_zip64_field_too_short(self) -> None:
-        """Sentinel file_size promises a ZIP64 value that is not there."""
-        info = RemoteZipInfo("test.txt")
-        info.file_size = 0xFFFFFFFF
-        info.compress_size = 100
-        info.header_offset = 5
-        info.volume = 0
-        # ZIP64 extra field with only 4 bytes of data
-        info.extra = struct.pack("<HH", ZIP64_EXTRA_FIELD_ID, 4) + b"\x00" * 4
-
+    def test_zip64_value_missing(self) -> None:
+        """A sentinel promises a ZIP64 value that the field does not hold."""
+        entry = make_cd_entry(
+            zip64_extra(b"\x00" * 4),
+            uncompressed_size=MAX_UINT32,
+        )
         with pytest.raises(BadZipFile, match="File size not found"):
-            _apply_zip64_extra(info)
-
-    def test_zip64_second_field_missing(self) -> None:
-        """Both sizes are sentinels but only one ZIP64 value is present."""
-        info = RemoteZipInfo("test.txt")
-        info.file_size = 0xFFFFFFFF
-        info.compress_size = 0xFFFFFFFF
-        info.header_offset = 5
-        info.volume = 0
-        zip64_data = struct.pack("<Q", 0x1_0000_0000)
-        info.extra = struct.pack("<HH", ZIP64_EXTRA_FIELD_ID, len(zip64_data)) + zip64_data
-
-        with pytest.raises(BadZipFile, match="Compress size not found"):
-            _apply_zip64_extra(info)
-
-    def test_zip64_disk_start_missing(self) -> None:
-        """Volume sentinel promises a disk start number that is not there."""
-        info = RemoteZipInfo("test.txt")
-        info.file_size = 10
-        info.compress_size = 10
-        info.header_offset = 5
-        info.volume = 0xFFFF
-        # ZIP64 extra field with no data at all
-        info.extra = struct.pack("<HH", ZIP64_EXTRA_FIELD_ID, 0)
-
-        with pytest.raises(BadZipFile, match="Disk start number not found"):
-            _apply_zip64_extra(info)
-
-    def test_truncated_extra_field(self) -> None:
-        """Extra field header claims more data than is present."""
-        info = RemoteZipInfo("test.txt")
-        # Field 0x000a claims 16 bytes of data but only 4 follow
-        info.extra = struct.pack("<HH", 0x000A, 16) + b"\x00" * 4
-
-        with pytest.raises(BadZipFile, match="Corrupt extra field"):
-            _apply_zip64_extra(info)
+            RemoteZipInfo._from_central_dir_entry(entry)

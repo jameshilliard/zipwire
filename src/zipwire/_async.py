@@ -6,16 +6,13 @@ import typing
 from contextlib import aclosing
 
 from zipwire._base import RemoteZipBase
-from zipwire._constants import (
-    LOCAL_FILE_HEADER_SIZE,
-    PREFETCH_EXTRA,
-    PREFETCH_THRESHOLD,
-)
+from zipwire._constants import PREFETCH_EXTRA, PREFETCH_THRESHOLD
 from zipwire._decompress import StreamingDecompressor, adecompress
 from zipwire._errors import BadZipFile, FileTooLarge, RangeRequestUnsupported
-from zipwire._parser import LocalHeaderInfo, find_eocd, parse_local_file_header
+from zipwire._parser import find_eocd
 from zipwire._write import awrite_all
 from zipwire._zipinfo import RemoteZipInfo
+from zipwire._zipstructs import LocalFileHeaderRecord
 
 if typing.TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -124,11 +121,11 @@ class AsyncRemoteZip(RemoteZipBase):
             # Small file: fetch local header + compressed data in one request.
             # Clamp to the archive end: the size comes from the central
             # directory and must not turn into a request past the end.
-            fetch_size = LOCAL_FILE_HEADER_SIZE + PREFETCH_EXTRA + info.compress_size
+            fetch_size = LocalFileHeaderRecord.FIXED_SIZE + PREFETCH_EXTRA + info.compress_size
             fetch_size = min(fetch_size, self.file_size - info.header_offset)
             buf, _ = await self._reader.read_range(info.header_offset, fetch_size)
-            local_header = parse_local_file_header(buf)
-            data_start = LOCAL_FILE_HEADER_SIZE + local_header.data_offset_past_header
+            local_header = LocalFileHeaderRecord.parse(buf)
+            data_start = LocalFileHeaderRecord.FIXED_SIZE + local_header.data_offset_past_header
             data_offset = info.header_offset + data_start
             if data_start + info.compress_size <= len(buf):
                 self._validate_data_region(info, data_offset)
@@ -140,13 +137,15 @@ class AsyncRemoteZip(RemoteZipBase):
             # variable fields so the filename can be validated; the
             # compressed data is fetched or streamed separately.
             fetch_size = min(
-                LOCAL_FILE_HEADER_SIZE + PREFETCH_EXTRA,
+                LocalFileHeaderRecord.FIXED_SIZE + PREFETCH_EXTRA,
                 self.file_size - info.header_offset,
             )
             buf, _ = await self._reader.read_range(info.header_offset, fetch_size)
-            local_header = parse_local_file_header(buf)
+            local_header = LocalFileHeaderRecord.parse(buf)
             data_offset = (
-                info.header_offset + LOCAL_FILE_HEADER_SIZE + local_header.data_offset_past_header
+                info.header_offset
+                + LocalFileHeaderRecord.FIXED_SIZE
+                + local_header.data_offset_past_header
             )
 
         self._validate_data_region(info, data_offset)
@@ -156,7 +155,7 @@ class AsyncRemoteZip(RemoteZipBase):
     async def _fetch_local_filename(
         self,
         info: RemoteZipInfo,
-        local_header: LocalHeaderInfo,
+        local_header: LocalFileHeaderRecord,
     ) -> bytes | None:
         """Return the raw local filename, fetching it if it was not prefetched.
 
@@ -171,7 +170,7 @@ class AsyncRemoteZip(RemoteZipBase):
         if local_header.filename is not None:
             return local_header.filename
         # Rare: the local filename exceeds the PREFETCH_EXTRA allowance.
-        offset = info.header_offset + LOCAL_FILE_HEADER_SIZE
+        offset = info.header_offset + LocalFileHeaderRecord.FIXED_SIZE
         filename, _ = await self._reader.read_range(offset, local_header.filename_length)
         if len(filename) != local_header.filename_length:
             raise BadZipFile(

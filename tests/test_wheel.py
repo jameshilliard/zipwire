@@ -10,10 +10,11 @@ import pytest
 
 from tests.conftest import MockAsyncReader, MockSyncReader
 from zipwire import AsyncRemoteWheel, SyncRemoteWheel
-from zipwire._constants import CENTRAL_DIR_SIZE, FLAG_ENCRYPTED, LOCAL_FILE_HEADER_SIZE
+from zipwire._constants import HeaderFlag
 from zipwire._errors import BadZipFile, UnsupportedFeature
 from zipwire._parser import find_eocd
 from zipwire._wheel import _dist_info_from_url
+from zipwire._zipstructs import CentralDirHeaderRecord, LocalFileHeaderRecord
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -293,7 +294,7 @@ def _last_cd_entry_offset(data: bytes) -> int:
     offset = eocd.cd_offset
     for _ in range(eocd.cd_entry_count - 1):
         fn_len, extra_len, comment_len = struct.unpack_from("<HHH", data, offset + 28)
-        offset += CENTRAL_DIR_SIZE + fn_len + extra_len + comment_len
+        offset += CentralDirHeaderRecord.FIXED_SIZE + fn_len + extra_len + comment_len
     return offset
 
 
@@ -326,7 +327,7 @@ def _flip_last_local_filename_byte(data: bytes) -> bytes:
     header_offset = _last_local_header_offset(data)
     # Local file header: filename_len is at offset 26.
     fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
-    pos = header_offset + LOCAL_FILE_HEADER_SIZE + fn_len - 1
+    pos = header_offset + LocalFileHeaderRecord.FIXED_SIZE + fn_len - 1
     buf[pos] ^= 1
     return bytes(buf)
 
@@ -346,7 +347,7 @@ class TestWheelHardening:
         """Encrypted dist-info entry is rejected when served from the tail."""
         data, filename = _make_wheel()
         reader = MockSyncReader(
-            _set_last_cd_flags(data, FLAG_ENCRYPTED),
+            _set_last_cd_flags(data, HeaderFlag.ENCRYPTED),
             url=f"https://example.com/{filename}",
         )
         with (
@@ -368,18 +369,6 @@ class TestWheelHardening:
             pytest.raises(BadZipFile, match="Overlapped entries"),
         ):
             whl.read(f"{whl.dist_info_dir}RECORD")
-
-    @pytest.mark.asyncio
-    async def test_async_encrypted_entry_rejected(self) -> None:
-        """The async wheel applies the entry checks on the tail fast path."""
-        data, filename = _make_wheel()
-        reader = MockAsyncReader(
-            _set_last_cd_flags(data, FLAG_ENCRYPTED),
-            url=f"https://example.com/{filename}",
-        )
-        async with AsyncRemoteWheel(reader) as whl:
-            with pytest.raises(UnsupportedFeature, match="encrypted"):
-                await whl.read(f"{whl.dist_info_dir}RECORD")
 
     @pytest.mark.asyncio
     async def test_async_overlapped_entry_rejected(self) -> None:

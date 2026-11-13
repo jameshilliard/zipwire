@@ -85,7 +85,7 @@ def test_sync_read_metadata(reader_cls) -> None:
 
 
 @pytest.mark.parametrize("reader_cls", ASYNC_READERS, ids=lambda cls: cls.__name__)
-async def test_async_read_metadata(reader_cls):
+async def test_async_read_metadata(reader_cls) -> None:
     meta = _metadata_path(PIP_WHL_URL)
     reader = reader_cls(PIP_WHL_URL)
     async with AsyncRemoteZip(reader) as rz:
@@ -111,7 +111,7 @@ def test_sync_read_metadata_pulp(reader_cls) -> None:
 
 
 @pytest.mark.parametrize("reader_cls", ASYNC_READERS, ids=lambda cls: cls.__name__)
-async def test_async_read_metadata_pulp(reader_cls):
+async def test_async_read_metadata_pulp(reader_cls) -> None:
     reader = reader_cls(PULP_WHL_URL)
     async with AsyncRemoteWheel(reader) as whl:
         assert whl.metadata_name in whl.namelist()

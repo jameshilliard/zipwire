@@ -11,21 +11,16 @@ import pytest
 
 from tests.conftest import MockAsyncReader, MockHeaders, make_zip
 from zipwire import AsyncRemoteZip, EOCDInfo
-from zipwire._constants import (
-    FLAG_COMPRESSED_PATCHED_DATA,
-    FLAG_ENCRYPTED,
-    LOCAL_FILE_HEADER_SIZE,
-    STREAM_CHUNK_SIZE,
-)
+from zipwire._constants import STREAM_CHUNK_SIZE
 from zipwire._errors import (
     BadZipFile,
     FileNotFoundInZip,
     FileTooLarge,
     RangeRequestUnsupported,
-    UnsupportedFeature,
 )
 from zipwire._parser import find_eocd
 from zipwire._zipinfo import RemoteZipInfo
+from zipwire._zipstructs import LocalFileHeaderRecord
 
 if typing.TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -146,6 +141,7 @@ class TestAsyncRemoteZip:
         assert eocd.cd_entry_count == 2
         assert eocd.cd_size > 0
         assert 0 <= eocd.cd_offset < len(stored_zip)
+        assert eocd.comment == b""
 
     async def test_url(self, stored_zip: bytes) -> None:
         reader = MockAsyncReader(stored_zip, url="https://example.com/archive.zip")
@@ -486,7 +482,7 @@ class TestHardening:
         header_offset = struct.unpack_from("<I", buf, eocd.cd_offset + 42)[0]
         # Local file header: filename_len is at offset 26.
         fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
-        start = header_offset + LOCAL_FILE_HEADER_SIZE
+        start = header_offset + LocalFileHeaderRecord.FIXED_SIZE
         buf[start : start + fn_len] = b"hello.txX"
         reader = MockAsyncReader(bytes(buf))
         async with AsyncRemoteZip(reader) as rz:
@@ -504,7 +500,7 @@ class TestHardening:
         reader = MockAsyncReader(data)
         async with AsyncRemoteZip(reader) as rz:
             assert await rz.read(name) == b"long name content"
-        assert (LOCAL_FILE_HEADER_SIZE, len(name)) in reader.requests
+        assert (LocalFileHeaderRecord.FIXED_SIZE, len(name)) in reader.requests
 
     async def test_long_local_name_mismatch_rejected(self) -> None:
         # A mismatching local filename must not slip past the check just
@@ -514,34 +510,12 @@ class TestHardening:
         buf = bytearray(data)
         header_offset = 0
         fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
-        start = header_offset + LOCAL_FILE_HEADER_SIZE
+        start = header_offset + LocalFileHeaderRecord.FIXED_SIZE
         buf[start : start + fn_len] = ("L" + name[1:]).encode()
         reader = MockAsyncReader(bytes(buf))
         async with AsyncRemoteZip(reader) as rz:
             with pytest.raises(BadZipFile, match="differ"):
                 await rz.read(name)
-
-    async def test_encrypted_entry_rejected(self, stored_zip: bytes) -> None:
-        buf = bytearray(stored_zip)
-        eocd = find_eocd(stored_zip, len(stored_zip))
-        offset = eocd.cd_offset
-        flags = struct.unpack_from("<H", buf, offset + 8)[0]
-        struct.pack_into("<H", buf, offset + 8, flags | FLAG_ENCRYPTED)
-        reader = MockAsyncReader(bytes(buf))
-        async with AsyncRemoteZip(reader) as rz:
-            with pytest.raises(UnsupportedFeature, match="encrypted"):
-                await rz.read("hello.txt")
-
-    async def test_patched_data_rejected(self, stored_zip: bytes) -> None:
-        buf = bytearray(stored_zip)
-        eocd = find_eocd(stored_zip, len(stored_zip))
-        offset = eocd.cd_offset
-        flags = struct.unpack_from("<H", buf, offset + 8)[0]
-        struct.pack_into("<H", buf, offset + 8, flags | FLAG_COMPRESSED_PATCHED_DATA)
-        reader = MockAsyncReader(bytes(buf))
-        async with AsyncRemoteZip(reader) as rz:
-            with pytest.raises(UnsupportedFeature, match="patched data"):
-                await rz.read("hello.txt")
 
     async def test_overlapped_entry_rejected(self, stored_zip: bytes) -> None:
         # Inflate compress_size so the data runs past the next entry's

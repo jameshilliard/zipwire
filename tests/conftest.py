@@ -263,6 +263,21 @@ def comment_zip() -> bytes:
     return buf.getvalue()
 
 
+@pytest.fixture(scope="session")
+def zip64_zip() -> bytes:
+    """ZIP with more than 65535 entries, forcing ZIP64 end records.
+
+    Built once per session; the entry count overflows the classic
+    EOCD's 16-bit field, so the archive carries a ZIP64 EOCD record
+    and locator with sentinel values in the classic record.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for i in range(65536 + 3):
+            zf.writestr(f"f{i}.txt", b"x")
+    return buf.getvalue()
+
+
 @pytest.fixture
 def large_file_zip() -> bytes:
     """ZIP with a STORED file exceeding PREFETCH_THRESHOLD (50 KiB)."""

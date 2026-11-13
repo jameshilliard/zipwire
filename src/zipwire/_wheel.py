@@ -27,10 +27,10 @@ import typing
 from urllib.parse import unquote, urlparse
 
 from zipwire._async import AsyncRemoteZip
-from zipwire._constants import LOCAL_FILE_HEADER_SIZE, PREFETCH_EXTRA
-from zipwire._parser import parse_local_file_header
+from zipwire._constants import PREFETCH_EXTRA
 from zipwire._sync import SyncRemoteZip
 from zipwire._zipinfo import RemoteZipInfo
+from zipwire._zipstructs import LocalFileHeaderRecord
 
 if typing.TYPE_CHECKING:
     from zipwire._types import AsyncReader, SyncReader
@@ -130,19 +130,26 @@ class _RemoteWheelMixin:
         """
         tail_start = self._tail_start
         tail_end = tail_start + len(self._tail_data)
-        end = info.header_offset + LOCAL_FILE_HEADER_SIZE + PREFETCH_EXTRA + info.compress_size
+        end = (
+            info.header_offset
+            + LocalFileHeaderRecord.FIXED_SIZE
+            + PREFETCH_EXTRA
+            + info.compress_size
+        )
         if info.header_offset < tail_start or end > tail_end:
             return None
         rel = info.header_offset - tail_start
-        local_header = parse_local_file_header(self._tail_data[rel:])
-        data_start = rel + LOCAL_FILE_HEADER_SIZE + local_header.data_offset_past_header
+        local_header = LocalFileHeaderRecord.parse(self._tail_data[rel:])
+        data_start = rel + LocalFileHeaderRecord.FIXED_SIZE + local_header.data_offset_past_header
         if data_start + info.compress_size > len(self._tail_data):
             # Rare: the local header's variable fields exceeded the
             # PREFETCH_EXTRA allowance, so the compressed data is not
             # fully covered by the tail.  Use the regular resolve path.
             return None
         data_offset = (
-            info.header_offset + LOCAL_FILE_HEADER_SIZE + local_header.data_offset_past_header
+            info.header_offset
+            + LocalFileHeaderRecord.FIXED_SIZE
+            + local_header.data_offset_past_header
         )
         self._validate_data_region(info, data_offset)  # type: ignore[attr-defined]
         self._check_local_filename(info, local_header.filename)  # type: ignore[attr-defined]

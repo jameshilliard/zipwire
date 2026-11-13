@@ -6,14 +6,7 @@ import os
 import sys
 import warnings
 
-from zipwire._constants import (
-    FLAG_COMPRESSED_PATCHED_DATA,
-    FLAG_ENCRYPTED,
-    FLAG_STRONG_ENCRYPTION,
-    FLAG_UTF8_FILENAME,
-    LOCAL_FILE_HEADER_SIZE,
-    MAX_EOCD_SEARCH,
-)
+from zipwire._constants import HeaderFlag
 from zipwire._errors import (
     BadZipFile,
     FileNotFoundInZip,
@@ -21,6 +14,11 @@ from zipwire._errors import (
 )
 from zipwire._parser import EOCDInfo, parse_central_directory
 from zipwire._zipinfo import RemoteZipInfo
+from zipwire._zipstructs import (
+    EOCDRecord,
+    LocalFileHeaderRecord,
+    filename_encoding,
+)
 
 _NOT_LOADED = "archive not loaded; use as a context manager"
 
@@ -108,18 +106,18 @@ class RemoteZipBase:
             BadZipFile: If the local file header offset lies beyond the
                 end of the archive.
         """
-        flags = info.flag_bits
-        if flags & FLAG_STRONG_ENCRYPTION:
+        # Most specific reason first when several flags are set.
+        if info.flag_bits & HeaderFlag.STRONG_ENCRYPTION:
             raise UnsupportedFeature(
                 f"{info.filename!r}: strong encryption (general purpose flag bit 6)"
             )
-        if flags & FLAG_COMPRESSED_PATCHED_DATA:
+        if info.flag_bits & HeaderFlag.COMPRESSED_PATCHED_DATA:
             raise UnsupportedFeature(
                 f"{info.filename!r}: compressed patched data (general purpose flag bit 5)"
             )
-        if flags & FLAG_ENCRYPTED:
-            raise UnsupportedFeature(f"{info.filename!r} is encrypted")
-        if info.header_offset + LOCAL_FILE_HEADER_SIZE > self.file_size:
+        if info.flag_bits & HeaderFlag.ENCRYPTED:
+            raise UnsupportedFeature(f"{info.filename!r}: encrypted")
+        if info.header_offset + LocalFileHeaderRecord.FIXED_SIZE > self.file_size:
             raise BadZipFile(
                 f"{info.filename!r}: local file header at offset {info.header_offset} "
                 "is beyond the end of the archive"
@@ -164,10 +162,10 @@ class RemoteZipBase:
 
         Like ``zipfile.ZipFile.open()``, the raw filename bytes from the
         local header are compared against the central directory name
-        encoded with the central directory's UTF-8 flag.  A mismatch
-        means the archive was crafted so that tools reading the local
-        header see a different member name than the central directory
-        reports.
+        encoded with the central directory's encoding, which the UTF-8
+        flag selects.  A mismatch means the archive was crafted so that
+        tools reading the local header see a different member name than
+        the central directory reports.
 
         Raises:
             BadZipFile: If the names differ or the local filename bytes
@@ -175,10 +173,7 @@ class RemoteZipBase:
         """
         if local_filename is None:
             raise BadZipFile(f"{info.filename!r}: local file header filename is truncated")
-        if info.flag_bits & FLAG_UTF8_FILENAME:
-            expected = info.orig_filename.encode("utf-8")
-        else:
-            expected = info.orig_filename.encode("cp437")
+        expected = info.orig_filename.encode(filename_encoding(info.flag_bits))
         if local_filename != expected:
             raise BadZipFile(
                 f"File name in directory {info.orig_filename!r} and "
@@ -194,9 +189,12 @@ class RemoteZipBase:
 
     @property
     def eocd_info(self) -> EOCDInfo:
-        """Parsed End of Central Directory record.
+        """Parsed End of Central Directory information.
 
-        Contains ``cd_offset``, ``cd_size``, and ``cd_entry_count``.
+        Contains ``cd_offset``, ``cd_size``, ``cd_entry_count``, and
+        ``comment`` (the .ZIP file comment).  The location and entry
+        count come from the ZIP64 end record when the archive uses
+        ZIP64 end records.
         """
         if self._eocd is None:
             raise RuntimeError(_NOT_LOADED)
@@ -206,10 +204,11 @@ class RemoteZipBase:
         """Return the number of bytes to fetch from the end of the file.
 
         Called during loading to determine the tail size.
-        The default returns :data:`MAX_EOCD_SEARCH`.  Subclasses may
+        The default returns the maximum EOCD record size (fixed part
+        plus the largest possible .ZIP file comment).  Subclasses may
         override this to request a larger tail.
         """
-        return MAX_EOCD_SEARCH
+        return EOCDRecord.MAX_SIZE
 
     def _store_tail(self, tail_start: int, tail: bytes) -> None:
         """Retain the initial tail fetch.

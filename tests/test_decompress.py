@@ -452,7 +452,7 @@ def test_feed_chunks_are_bounded(method: int, compress: Callable[[bytes], bytes]
     chunks = list(sd.feed_chunks(compressed))
     assert max(map(len, chunks)) <= STREAM_CHUNK_SIZE
     assert b"".join(chunks) == original
-    assert sd.finish() is None
+    assert sd.finish() is None  # type: ignore[func-returns-value]
 
 
 def test_stored_feed_chunks_are_bounded() -> None:
@@ -461,7 +461,7 @@ def test_stored_feed_chunks_are_bounded() -> None:
     sd = StreamingDecompressor(method=0, expected_crc=crc)
     chunks = list(sd.feed_chunks(original))
     assert [len(chunk) for chunk in chunks] == [STREAM_CHUNK_SIZE, STREAM_CHUNK_SIZE, 1]
-    assert sd.finish() is None
+    assert sd.finish() is None  # type: ignore[func-returns-value]
 
 
 def test_feed_chunks_yields_empty_step() -> None:
@@ -472,7 +472,7 @@ def test_feed_chunks_yields_empty_step() -> None:
     sd = StreamingDecompressor(method=12, expected_crc=crc)
     assert list(sd.feed_chunks(compressed[:3])) == [b""]
     assert sd.feed(compressed[3:]) == original
-    assert sd.finish() is None
+    assert sd.finish() is None  # type: ignore[func-returns-value]
 
 
 async def test_adecompress_stored() -> None:
@@ -529,7 +529,7 @@ def test_streaming_expected_size() -> None:
     crc = zlib.crc32(original) & 0xFFFFFFFF
     sd = StreamingDecompressor(method=8, expected_crc=crc, expected_size=len(original))
     sd.feed(compressed)
-    assert sd.finish() is None
+    assert sd.finish() is None  # type: ignore[func-returns-value]
 
 
 def test_streaming_expected_size_mismatch() -> None:

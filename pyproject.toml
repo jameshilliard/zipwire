@@ -45,6 +45,8 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-httpserver>=1",
     "coverage[toml]>=7",
+    "mypy>=2.4",
+    "pyrefly>=1.4",
     "ruff>=0.11",
 ]
 docs = [
@@ -77,6 +79,23 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "UP", "B", "SIM", "TCH", "RUF"]
+
+[tool.pyrefly]
+project-includes = ["src/**/*.py", "tests/**/*.py"]
+python-version = "3.11"
+enable-fallback-search-path = true
+ignore-missing-imports = [
+    "compression",  # Python 3.14+
+    "compression.zstd",
+]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["compression", "compression.zstd"]
+ignore_missing_imports = true
 
 [tool.coverage.run]
 branch = true

@@ -95,13 +95,13 @@ class FileReader:
         return self._size
 
     def head(self) -> Headers:
-        return _stat_headers(self._file_size())
+        return _stat_headers(self._file_size())  # type: ignore[return-value]
 
     def read_range(self, offset: int, length: int) -> tuple[bytes, Headers]:
         fh = self._open()
         fh.seek(offset)
         data = fh.read(length)
-        return data, _stat_headers(self._file_size())
+        return data, _stat_headers(self._file_size())  # type: ignore[return-value]
 
     def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
         fh = self._open()
@@ -167,7 +167,7 @@ class AsyncFileReader:
 
     async def head(self) -> Headers:
         size = await asyncio.to_thread(self._file_size)
-        return _stat_headers(size)
+        return _stat_headers(size)  # type: ignore[return-value]
 
     async def read_range(self, offset: int, length: int) -> tuple[bytes, Headers]:
         def _read() -> tuple[bytes, int]:
@@ -176,7 +176,7 @@ class AsyncFileReader:
             return fh.read(length), self._file_size()
 
         data, size = await asyncio.to_thread(_read)
-        return data, _stat_headers(size)
+        return data, _stat_headers(size)  # type: ignore[return-value]
 
     async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
         def _open_seek() -> typing.BinaryIO:

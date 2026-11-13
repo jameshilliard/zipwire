@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import io
 from contextlib import closing
+from typing import TYPE_CHECKING
 
 import pytest
 import urllib3
 from werkzeug import Request, Response
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from tests.conftest import (
     has_aiohttp,
@@ -39,7 +43,7 @@ if has_aiohttp:
     from zipwire.backends import AiohttpReader
 
 
-def range_handler(zip_data: bytes):
+def range_handler(zip_data: bytes) -> Callable[[Request], Response]:
     """Create a handler that supports HEAD and Range GET requests."""
 
     def handler(request: Request) -> Response:

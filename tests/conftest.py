@@ -67,6 +67,28 @@ def make_zip(files: dict[str, bytes], *, compression: int = zipfile.ZIP_STORED) 
     return buf.getvalue()
 
 
+class MockHeaders:
+    """Lower-case header mapping for mock readers.
+
+    A plain dict would work at runtime, but pyrefly cannot match the
+    overloaded ``get`` of the mapping types against the Headers protocol;
+    declaring the protocol's signatures directly makes the mock readers
+    verify against SyncReader and AsyncReader.
+    """
+
+    def __init__(self, headers: dict[str, str] | None = None) -> None:
+        self._headers: dict[str, str] = dict(headers) if headers else {}
+
+    def __getitem__(self, key: str, /) -> str:
+        return self._headers[key]
+
+    def __contains__(self, key: object, /) -> bool:
+        return key in self._headers
+
+    def get(self, key: str, default: str | None = None, /) -> str | None:
+        return self._headers.get(key, default)
+
+
 class MockSyncReader:
     """A SyncReader backed by in-memory bytes (simulates a remote ZIP)."""
 
@@ -81,23 +103,25 @@ class MockSyncReader:
     def url(self) -> str:
         return self._url
 
-    def head(self) -> dict[str, str]:
-        return {
-            "content-length": str(len(self.data)),
-            "accept-ranges": "bytes",
-        }
+    def head(self) -> MockHeaders:
+        return MockHeaders(
+            {
+                "content-length": str(len(self.data)),
+                "accept-ranges": "bytes",
+            }
+        )
 
     def read_range(
         self,
         offset: int,
         length: int,
-    ) -> tuple[bytes, dict[str, str]]:
+    ) -> tuple[bytes, MockHeaders]:
         self.read_count += 1
         self.requests.append((offset, length))
         total = len(self.data)
         chunk = self.data[offset : offset + length]
         end = offset + len(chunk) - 1
-        headers = {"content-range": f"bytes {offset}-{end}/{total}"}
+        headers = MockHeaders({"content-range": f"bytes {offset}-{end}/{total}"})
         return chunk, headers
 
     def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
@@ -125,23 +149,25 @@ class MockAsyncReader:
     def url(self) -> str:
         return self._url
 
-    async def head(self) -> dict[str, str]:
-        return {
-            "content-length": str(len(self.data)),
-            "accept-ranges": "bytes",
-        }
+    async def head(self) -> MockHeaders:
+        return MockHeaders(
+            {
+                "content-length": str(len(self.data)),
+                "accept-ranges": "bytes",
+            }
+        )
 
     async def read_range(
         self,
         offset: int,
         length: int,
-    ) -> tuple[bytes, dict[str, str]]:
+    ) -> tuple[bytes, MockHeaders]:
         self.read_count += 1
         self.requests.append((offset, length))
         total = len(self.data)
         chunk = self.data[offset : offset + length]
         end = offset + len(chunk) - 1
-        headers = {"content-range": f"bytes {offset}-{end}/{total}"}
+        headers = MockHeaders({"content-range": f"bytes {offset}-{end}/{total}"})
         return chunk, headers
 
     async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:

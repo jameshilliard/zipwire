@@ -9,7 +9,7 @@ import zipfile
 
 import pytest
 
-from tests.conftest import MockSyncReader, make_zip
+from tests.conftest import MockHeaders, MockSyncReader, make_zip
 from zipwire import EOCDInfo, SyncRemoteZip
 from zipwire._constants import (
     CENTRAL_DIR_SIZE,
@@ -421,7 +421,7 @@ class TestSyncRemoteZip:
 
     def test_no_content_length(self, stored_zip: bytes) -> None:
         reader = MockSyncReader(stored_zip)
-        reader.head = lambda: {"accept-ranges": "bytes"}
+        reader.head = lambda: MockHeaders({"accept-ranges": "bytes"})  # type: ignore[method-assign]
         with pytest.raises(RangeRequestUnsupported, match="Content-Length"), SyncRemoteZip(reader):
             pass
 
@@ -469,7 +469,7 @@ class ShortTailReader(MockSyncReader):
         self,
         offset: int,
         length: int,
-    ) -> tuple[bytes, dict[str, str]]:
+    ) -> tuple[bytes, MockHeaders]:
         data, headers = super().read_range(offset, length)
         if self.read_count == 1:
             data = data[:-1]
@@ -483,7 +483,7 @@ class ShortCdReader(MockSyncReader):
         self,
         offset: int,
         length: int,
-    ) -> tuple[bytes, dict[str, str]]:
+    ) -> tuple[bytes, MockHeaders]:
         data, headers = super().read_range(offset, length)
         if self.read_count == 2:
             data = data[:-1]
@@ -497,7 +497,7 @@ class ShortFilenameReader(MockSyncReader):
         self,
         offset: int,
         length: int,
-    ) -> tuple[bytes, dict[str, str]]:
+    ) -> tuple[bytes, MockHeaders]:
         data, headers = super().read_range(offset, length)
         if self.read_count == 4:
             data = data[:-1]

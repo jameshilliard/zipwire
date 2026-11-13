@@ -63,7 +63,7 @@ class Httpx2SyncReader:
             raise RangeRequestUnsupported(
                 f"Server does not support range requests for {self._url}"
             )
-        return resp.headers
+        return resp.headers  # type: ignore[return-value]
 
     def read_range(
         self,
@@ -77,7 +77,7 @@ class Httpx2SyncReader:
             raise RangeRequestUnsupported(
                 f"Server does not support range requests for {self._url}"
             )
-        return resp.content, resp.headers
+        return resp.content, resp.headers  # type: ignore[return-value]
 
     def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
         logger.debug(
@@ -131,7 +131,7 @@ class Httpx2AsyncReader:
             raise RangeRequestUnsupported(
                 f"Server does not support range requests for {self._url}"
             )
-        return resp.headers
+        return resp.headers  # type: ignore[return-value]
 
     async def read_range(
         self,
@@ -145,7 +145,7 @@ class Httpx2AsyncReader:
             raise RangeRequestUnsupported(
                 f"Server does not support range requests for {self._url}"
             )
-        return resp.content, resp.headers
+        return resp.content, resp.headers  # type: ignore[return-value]
 
     async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
         logger.debug(

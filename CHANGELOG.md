@@ -82,6 +82,8 @@ releases; they are marked **BREAKING**.
 
 ### Internal
 
+- The library and test suite are now type checked with pyrefly and mypy,
+  and type annotations were completed and improved throughout.
 - `StreamingDecompressor` no longer writes to a destination; `feed()`
   returns decompressed bytes and `finish()` verifies that the stream ended
   cleanly and checks the CRC-32 and expected size without returning data,

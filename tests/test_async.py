@@ -9,7 +9,7 @@ import zipfile
 
 import pytest
 
-from tests.conftest import MockAsyncReader, make_zip
+from tests.conftest import MockAsyncReader, MockHeaders, make_zip
 from zipwire import AsyncRemoteZip, EOCDInfo
 from zipwire._constants import (
     FLAG_COMPRESSED_PATCHED_DATA,
@@ -437,10 +437,10 @@ class TestAsyncRemoteZip:
     async def test_no_content_length(self, stored_zip: bytes) -> None:
         reader = MockAsyncReader(stored_zip)
 
-        async def _head_no_cl() -> dict[str, str]:
-            return {"accept-ranges": "bytes"}
+        async def _head_no_cl() -> MockHeaders:
+            return MockHeaders({"accept-ranges": "bytes"})
 
-        reader.head = _head_no_cl
+        reader.head = _head_no_cl  # type: ignore[method-assign]
         with pytest.raises(RangeRequestUnsupported, match="Content-Length"):
             async with AsyncRemoteZip(reader):
                 pass
@@ -453,7 +453,7 @@ class ShortTailAsyncReader(MockAsyncReader):
         self,
         offset: int,
         length: int,
-    ) -> tuple[bytes, dict[str, str]]:
+    ) -> tuple[bytes, MockHeaders]:
         data, headers = await super().read_range(offset, length)
         if self.read_count == 1:
             data = data[:-1]
@@ -467,7 +467,7 @@ class ShortFilenameAsyncReader(MockAsyncReader):
         self,
         offset: int,
         length: int,
-    ) -> tuple[bytes, dict[str, str]]:
+    ) -> tuple[bytes, MockHeaders]:
         data, headers = await super().read_range(offset, length)
         if self.read_count == 4:
             data = data[:-1]

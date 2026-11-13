@@ -19,13 +19,25 @@ class Headers(typing.Protocol):
     including ``urllib3.HTTPHeaderDict``, ``requests.structures.CaseInsensitiveDict``,
     ``httpx2.Headers``, ``aiohttp.CIMultiDictProxy``, and plain ``dict``
     with lower-case keys.
+
+    The methods take their arguments positional-only, like the stdlib
+    mapping types; several implementations (``dict``, ``HTTPHeaderDict``,
+    ``CIMultiDictProxy``) do not accept them as keywords.
+
+    Every standard header mapping satisfies this protocol at runtime, but
+    not under static type checking: the mapping types declare an overloaded
+    ``get`` whose one-argument variant cannot be a subtype of this
+    two-argument signature, per the typing spec's overload rules.  Both
+    mypy and pyrefly therefore reject the header returns, and the backends
+    carry ``# type: ignore[return-value]`` comments to suppress the
+    expected errors.
     """
 
-    def __getitem__(self, key: str) -> str: ...
+    def __getitem__(self, key: str, /) -> str: ...
 
-    def __contains__(self, key: object) -> bool: ...
+    def __contains__(self, key: object, /) -> bool: ...
 
-    def get(self, key: str, default: str | None = None) -> str | None: ...
+    def get(self, key: str, default: str | None = None, /) -> str | None: ...
 
 
 @typing.runtime_checkable

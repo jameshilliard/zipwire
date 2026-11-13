@@ -242,7 +242,7 @@ async def test_async_invalid_write_count(size: int, failure: str) -> None:
 def test_async_writable_is_not_runtime_checkable() -> None:
     """isinstance() cannot tell sync and async writers apart, so it must fail."""
     with pytest.raises(TypeError, match="runtime_checkable"):
-        isinstance(io.BytesIO(), AsyncWritable)
+        isinstance(io.BytesIO(), AsyncWritable)  # type: ignore[misc]
 
 
 async def test_writer_backpressure(large_file_zip: bytes) -> None:

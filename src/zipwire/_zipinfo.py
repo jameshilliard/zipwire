@@ -20,6 +20,12 @@ class RemoteZipInfo(zipfile.ZipInfo):
     attributes and methods (is_dir, FileHeader, etc.) are available.
     """
 
+    # End of the entry's data region: the next entry's local header
+    # offset, or the central directory offset for the last entry.
+    # RemoteZip assigns it after parsing the central directory; it is
+    # None for entries that have not been through that step.
+    _end_offset: int | None = None
+
     @classmethod
     def _from_central_dir_entry(cls, entry: CentralDirEntry) -> RemoteZipInfo:
         """Construct a ZipInfo from a parsed central directory entry."""

@@ -31,11 +31,12 @@ class RemoteZipBase:
     instantiated directly.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, metadata_encoding: str | None = None) -> None:
         self._entries: list[RemoteZipInfo] | None = None
         self._name_index: dict[str, RemoteZipInfo] | None = None
         self._file_size: int | None = None
         self._eocd: EOCDInfo | None = None
+        self._metadata_encoding = metadata_encoding
 
     def _clear(self) -> None:
         """Reset all loaded state."""
@@ -79,7 +80,10 @@ class RemoteZipBase:
                 f"Central directory fetch returned {len(cd_data)} of {eocd.cd_size} bytes"
             )
         raw_entries = parse_central_directory(cd_data, eocd.cd_entry_count)
-        entries = [RemoteZipInfo._from_central_dir_entry(e) for e in raw_entries]
+        entries = [
+            RemoteZipInfo._from_central_dir_entry(e, metadata_encoding=self._metadata_encoding)
+            for e in raw_entries
+        ]
         # Record where each entry's data region ends: the start of the
         # next entry's local header, or the central directory for the
         # entry closest to it.  Like zipfile, this is used to detect
@@ -160,21 +164,28 @@ class RemoteZipBase:
     def _check_local_filename(self, info: RemoteZipInfo, local_filename: bytes | None) -> None:
         """Compare the local file header name with the central directory name.
 
-        Like ``zipfile.ZipFile.open()``, the raw filename bytes from the
-        local header are compared against the central directory name
-        encoded with the central directory's encoding, which the UTF-8
-        flag selects.  A mismatch means the archive was crafted so that
+        Like ``zipfile.ZipFile.open()``, the local header filename bytes
+        are decoded with the central directory's encoding, which the
+        UTF-8 flag selects, with *metadata_encoding* overriding the
+        CP437 default for entries without the flag.  Decoding both sides
+        (rather than re-encoding the central directory name) keeps the
+        check working for codecs where encoding is not the inverse of
+        decoding.  A mismatch means the archive was crafted so that
         tools reading the local header see a different member name than
         the central directory reports.
 
         Raises:
             BadZipFile: If the names differ or the local filename bytes
                 are missing.
+            UnicodeDecodeError: If the local filename bytes are not
+                valid in the central directory encoding.
         """
         if local_filename is None:
             raise BadZipFile(f"{info.filename!r}: local file header filename is truncated")
-        expected = info.orig_filename.encode(filename_encoding(info.flag_bits))
-        if local_filename != expected:
+        local_name = local_filename.decode(
+            filename_encoding(info.flag_bits, self._metadata_encoding)
+        )
+        if local_name != info.orig_filename:
             raise BadZipFile(
                 f"File name in directory {info.orig_filename!r} and "
                 f"header {local_filename!r} differ."

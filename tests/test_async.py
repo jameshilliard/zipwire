@@ -9,7 +9,12 @@ import zipfile
 
 import pytest
 
-from tests.conftest import MockAsyncReader, MockHeaders, make_zip
+from tests.conftest import (
+    MockAsyncReader,
+    MockHeaders,
+    legacy_encoded_zip,
+    make_zip,
+)
 from zipwire import AsyncRemoteZip, EOCDInfo
 from zipwire._constants import STREAM_CHUNK_SIZE
 from zipwire._errors import (
@@ -184,7 +189,7 @@ class TestAsyncRemoteZip:
         async with AsyncRemoteZip(reader) as rz:
             names = rz.namelist()
         assert "\u00e9\u00e0\u00fc.txt" in names
-        assert "\u4f60\u597d/world.txt" in names
+        assert "€100/rates.txt" in names
 
     async def test_empty_zip(self, empty_zip: bytes) -> None:
         reader = MockAsyncReader(empty_zip)
@@ -579,3 +584,19 @@ class TestHardening:
         async with AsyncRemoteZip(reader) as rz:
             with pytest.raises(BadZipFile, match="filename fetch returned"):
                 await rz.read(name)
+
+
+class TestFilenameEncoding:
+    """``metadata_encoding`` for entries without the UTF-8 flag."""
+
+    async def test_metadata_encoding(self) -> None:
+        data = legacy_encoded_zip("naïve-Ÿ.txt", "cp1252")
+        reader = MockAsyncReader(data)
+        async with AsyncRemoteZip(reader, metadata_encoding="cp1252") as rz:
+            assert rz.namelist() == ["naïve-Ÿ.txt"]
+            assert await rz.read("naïve-Ÿ.txt") == b"legacy content"
+
+    async def test_metadata_encoding_never_overrides_utf8_flag(self, unicode_zip: bytes) -> None:
+        reader = MockAsyncReader(unicode_zip)
+        async with AsyncRemoteZip(reader, metadata_encoding="cp1252") as rz:
+            assert "€100/rates.txt" in rz.namelist()

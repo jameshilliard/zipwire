@@ -58,11 +58,13 @@ def filename_encoding(flags: int, metadata_encoding: str | None = None) -> str:
     """Return the encoding of a file name carried with *flags*.
 
     UTF-8 when general purpose flag bit 11 is set, otherwise
-    *metadata_encoding* or CP437, as in ``zipfile``.
+    *metadata_encoding* or CP437, as in ``zipfile``.  A falsy
+    *metadata_encoding* means the CP437 default, matching
+    ``zipfile``'s ``metadata_encoding or 'cp437'``.
     """
     if flags & HeaderFlag.UTF8_FILENAME:
         return "utf-8"
-    if metadata_encoding is not None:
+    if metadata_encoding:
         return metadata_encoding
     return "cp437"
 

@@ -30,10 +30,19 @@ class SyncRemoteZip(RemoteZipBase):
             for info in rz.infolist():
                 print(info.filename)
             data = rz.read("path/to/file.txt")
+
+    Args:
+        reader: A :class:`~zipwire.SyncReader` that serves range
+            requests for the archive.
+        metadata_encoding: Codec for entry names without the UTF-8
+            flag (default CP437), as in ``zipfile.ZipFile``.
+
+    .. versionadded:: 0.6.0
+       The *metadata_encoding* argument.
     """
 
-    def __init__(self, reader: SyncReader) -> None:
-        super().__init__()
+    def __init__(self, reader: SyncReader, *, metadata_encoding: str | None = None) -> None:
+        super().__init__(metadata_encoding=metadata_encoding)
         self._reader = reader
 
     def __enter__(self) -> typing.Self:

@@ -32,10 +32,19 @@ class AsyncRemoteZip(RemoteZipBase):
             for info in rz.infolist():
                 print(info.filename)
             data = await rz.read("path/to/file.txt")
+
+    Args:
+        reader: An :class:`~zipwire.AsyncReader` that serves range
+            requests for the archive.
+        metadata_encoding: Codec for entry names without the UTF-8
+            flag (default CP437), as in ``zipfile.ZipFile``.
+
+    .. versionadded:: 0.6.0
+       The *metadata_encoding* argument.
     """
 
-    def __init__(self, reader: AsyncReader) -> None:
-        super().__init__()
+    def __init__(self, reader: AsyncReader, *, metadata_encoding: str | None = None) -> None:
+        super().__init__(metadata_encoding=metadata_encoding)
         self._reader = reader
 
     async def __aenter__(self) -> typing.Self:

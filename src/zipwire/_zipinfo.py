@@ -28,9 +28,14 @@ class RemoteZipInfo(zipfile.ZipInfo):
     _end_offset: int | None = None
 
     @classmethod
-    def _from_central_dir_entry(cls, entry: CentralDirHeaderRecord) -> RemoteZipInfo:
+    def _from_central_dir_entry(
+        cls,
+        entry: CentralDirHeaderRecord,
+        *,
+        metadata_encoding: str | None = None,
+    ) -> RemoteZipInfo:
         """Construct a ZipInfo from a parsed central directory entry."""
-        info = cls(entry.decode_filename())
+        info = cls(entry.decode_filename(metadata_encoding=metadata_encoding))
 
         info.date_time = entry.date_time
         info.compress_type = entry.compression_method

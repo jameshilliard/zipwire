@@ -10,6 +10,12 @@ releases; they are marked **BREAKING**.
 
 ### Added
 
+- `SyncRemoteZip` and `AsyncRemoteZip` accept a `metadata_encoding`
+  argument that overrides CP437 for entry names without the UTF-8
+  flag, as in stdlib `zipfile`.
+- The wheel classes now always decode entry names as UTF-8, as PEP 427
+  requires, even when the UTF-8 flag is missing. They do not expose the
+  `metadata_encoding` argument.
 - `EOCDInfo` now carries the .ZIP file comment in a new `comment` field,
   taken from the classic end record for ZIP64 archives.
 - The Unicode Path extra field (0x7075) is now honored: a CRC-32-matched
@@ -61,8 +67,9 @@ releases; they are marked **BREAKING**.
   `ZipFile.open()`. An archive whose local header names a different
   member than the central directory, crafted so that scanners and
   extractors disagree about member names, is rejected with
-  `BadZipFile`. The check covers the sync and async readers and the
-  wheel tail fast path.
+  `BadZipFile`; bytes that do not decode in the expected encoding raise
+  `UnicodeDecodeError`. The check covers the sync and async readers and
+  the wheel tail fast path.
 
 ### Changed
 

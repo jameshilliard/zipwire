@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import io
+import struct
 import typing
 import zipfile
 from importlib.util import find_spec
 
 import pytest
+
+from zipwire._parser import find_eocd
+from zipwire._zipstructs import CentralDirHeaderRecord, LocalFileHeaderRecord
 
 has_httpx2 = find_spec("httpx2") is not None
 has_requests = find_spec("requests") is not None
@@ -65,6 +69,36 @@ def make_zip(files: dict[str, bytes], *, compression: int = zipfile.ZIP_STORED) 
         for name, data in files.items():
             zf.writestr(name, data)
     return buf.getvalue()
+
+
+def cd_entry_offset(data: bytes, index: int = 0) -> int:
+    """Absolute offset of central directory entry *index* in *data*."""
+    eocd = find_eocd(data, len(data))
+    offset = eocd.cd_offset
+    for _ in range(index):
+        fn_len, extra_len, comment_len = struct.unpack_from("<HHH", data, offset + 28)
+        offset += CentralDirHeaderRecord.FIXED_SIZE + fn_len + extra_len + comment_len
+    return offset
+
+
+def legacy_encoded_zip(name: str, encoding: str, content: bytes = b"legacy content") -> bytes:
+    """A single-entry ZIP whose entry name is encoded with a legacy codec.
+
+    The archive is written with an ASCII placeholder of the same byte
+    length, then the raw *encoding* bytes are patched into the local
+    file header and the central directory, leaving the UTF-8 flag
+    unset so the name decodes as CP437 by default.
+    """
+    raw = name.encode(encoding)
+    data = make_zip({"l" * len(raw): content})
+    buf = bytearray(data)
+    cd_off = cd_entry_offset(data)
+    cd_fixed = CentralDirHeaderRecord.FIXED_SIZE
+    buf[cd_off + cd_fixed : cd_off + cd_fixed + len(raw)] = raw
+    header_offset = struct.unpack_from("<I", buf, cd_off + 42)[0]
+    lfh_fixed = LocalFileHeaderRecord.FIXED_SIZE
+    buf[header_offset + lfh_fixed : header_offset + lfh_fixed + len(raw)] = raw
+    return bytes(buf)
 
 
 class MockHeaders:
@@ -232,7 +266,7 @@ def unicode_zip() -> bytes:
     return make_zip(
         {
             "\u00e9\u00e0\u00fc.txt": b"unicode content",
-            "\u4f60\u597d/world.txt": b"hello",
+            "\u20ac100/rates.txt": b"hello",
         }
     )
 

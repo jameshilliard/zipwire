@@ -47,9 +47,11 @@ Out of scope
 Full ``zipfile`` compatibility
    zipwire is not designed as a replacement for :mod:`zipfile`.  It reads
    modern archives produced by current mainstream tools and package
-   builders, and makes no promise of matching :mod:`zipfile` for malformed,
-   ambiguous, or legacy archives.  Code that needs a general-purpose reader
-   for arbitrary local archives should use :mod:`zipfile`.
+   builders, and makes no promise of matching :mod:`zipfile` for malformed
+   or ambiguous archives.  Legacy filename encodings are supported only
+   through the explicit ``metadata_encoding`` argument; other legacy
+   quirks are out of scope.  Code that needs a general-purpose reader for
+   arbitrary local archives should use :mod:`zipfile`.
 
 Other transports (S3, FTP, ...)
    zipwire reads over HTTP(S) range requests and plain file IO.  Other

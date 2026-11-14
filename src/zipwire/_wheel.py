@@ -176,6 +176,9 @@ class SyncRemoteWheel(_RemoteWheelMixin, SyncRemoteZip):
     and fetches a larger tail so that dist-info entries at the end of
     the archive are served from the buffer without extra HTTP requests.
 
+    Entry names are always decoded as UTF-8, as PEP 427 requires;
+    there is no ``metadata_encoding`` argument.
+
     Must be used as a context manager.  Not thread-safe.
 
     Usage::
@@ -187,7 +190,8 @@ class SyncRemoteWheel(_RemoteWheelMixin, SyncRemoteZip):
     """
 
     def __init__(self, reader: SyncReader) -> None:
-        super().__init__(reader)
+        # PEP 427 requires UTF-8 file names.
+        super().__init__(reader, metadata_encoding="utf-8")
         self._init_wheel(reader.url)
 
     def _resolve_entry(
@@ -211,6 +215,9 @@ class AsyncRemoteWheel(_RemoteWheelMixin, AsyncRemoteZip):
     and fetches a larger tail so that dist-info entries at the end of
     the archive are served from the buffer without extra HTTP requests.
 
+    Entry names are always decoded as UTF-8, as PEP 427 requires;
+    there is no ``metadata_encoding`` argument.
+
     Must be used as an async context manager.  Not thread-safe.
 
     Usage::
@@ -222,7 +229,8 @@ class AsyncRemoteWheel(_RemoteWheelMixin, AsyncRemoteZip):
     """
 
     def __init__(self, reader: AsyncReader) -> None:
-        super().__init__(reader)
+        # PEP 427 requires UTF-8 file names.
+        super().__init__(reader, metadata_encoding="utf-8")
         self._init_wheel(reader.url)
 
     async def _resolve_entry(

@@ -129,6 +129,25 @@ class TestSyncRemoteWheel:
             pass
         assert reader.closed
 
+    def test_metadata_encoding_not_exposed(self) -> None:
+        # Wheels always decode names as UTF-8 (PEP 427), so there is
+        # nothing to configure.
+        reader = MockSyncReader(b"")
+        with pytest.raises(TypeError, match="metadata_encoding"):
+            SyncRemoteWheel(reader, metadata_encoding="cp1252")  # type: ignore[call-arg]
+
+    def test_utf8_name_without_flag(self) -> None:
+        # PEP 427 mandates UTF-8 entry names even when general purpose
+        # flag bit 11 is not set.
+        raw = "café.txt".encode()
+        placeholder = "c" * len(raw)
+        data, filename = _make_wheel(extra_files={placeholder: b"content"})
+        data = data.replace(placeholder.encode(), raw)
+        assert data.count(raw) == 2  # local header and central directory
+        reader = MockSyncReader(data, url=f"https://example.com/{filename}")
+        with SyncRemoteWheel(reader) as whl:
+            assert whl.read("café.txt") == b"content"
+
     def test_basic(self) -> None:
         data, filename = _make_wheel()
         reader = MockSyncReader(data, url=f"https://example.com/{filename}")
@@ -234,6 +253,24 @@ class TestAsyncRemoteWheel:
             async with AsyncRemoteWheel(reader):
                 pass
         assert reader.closed
+
+    async def test_metadata_encoding_not_exposed(self) -> None:
+        # Wheels always decode names as UTF-8 (PEP 427), so there is
+        # nothing to configure.
+        reader = MockAsyncReader(b"")
+        with pytest.raises(TypeError, match="metadata_encoding"):
+            AsyncRemoteWheel(reader, metadata_encoding="cp1252")  # type: ignore[call-arg]
+
+    async def test_utf8_name_without_flag(self) -> None:
+        # PEP 427 mandates UTF-8 entry names even when general purpose
+        # flag bit 11 is not set.
+        raw = "café.txt".encode()
+        placeholder = "c" * len(raw)
+        data, filename = _make_wheel(extra_files={placeholder: b"content"})
+        data = data.replace(placeholder.encode(), raw)
+        reader = MockAsyncReader(data, url=f"https://example.com/{filename}")
+        async with AsyncRemoteWheel(reader) as whl:
+            assert await whl.read("café.txt") == b"content"
 
     @pytest.mark.asyncio
     async def test_basic(self) -> None:

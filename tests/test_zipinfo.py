@@ -79,7 +79,7 @@ class TestRemoteZipInfoCompat:
         infos = self._get_infos(unicode_zip)
         filenames = [info.filename for info in infos]
         assert "éàü.txt" in filenames
-        assert "你好/world.txt" in filenames
+        assert "€100/rates.txt" in filenames
 
     def test_header_offset(self, stored_zip: bytes) -> None:
         infos = self._get_infos(stored_zip)

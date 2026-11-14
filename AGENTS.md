@@ -75,11 +75,15 @@ The human contribution workflow (issues, pull requests, security reports) is in
 
 - **Keep docs in sync with API changes.** Whenever you add, remove, rename,
   or change the signature of any public API (classes, functions, exceptions,
-  type aliases, backends), you **must** update all of these:
-  1. `src/zipwire/__init__.py` -- module docstring (usage examples, backend
-     list) and `__all__`.
-  2. `docs/` -- Sphinx sources (`api.rst`, `backends.rst`, `quickstart.rst`,
-     and any other affected `.rst` file).
+  type aliases, backends), you **must** update the `docs/` Sphinx sources
+  (`api.rst`, `backends.rst`, `quickstart.rst`, and any other affected
+  `.rst` file). Also update `src/zipwire/__init__.py` -- module docstring
+  and `__all__` -- for important or backwards-incompatible changes, such
+  as a new or renamed backend or export. Routine additions like a new
+  keyword argument do not need a module docstring update.
+- **Keep the `src/zipwire/__init__.py` module docstring light.** Show usage
+  examples for the most important features only; document arguments and
+  secondary features in the class docstrings and `docs/` instead.
 - After editing docs, run the documentation build from [Commands](#commands).
 
 ## Changelog rules

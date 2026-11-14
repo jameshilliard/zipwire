@@ -9,7 +9,13 @@ import zipfile
 
 import pytest
 
-from tests.conftest import MockHeaders, MockSyncReader, make_zip
+from tests.conftest import (
+    MockHeaders,
+    MockSyncReader,
+    cd_entry_offset,
+    legacy_encoded_zip,
+    make_zip,
+)
 from zipwire import EOCDInfo, SyncRemoteZip
 from zipwire._constants import STREAM_CHUNK_SIZE, HeaderFlag
 from zipwire._errors import (
@@ -22,7 +28,6 @@ from zipwire._errors import (
 from zipwire._parser import find_eocd
 from zipwire._zipinfo import RemoteZipInfo
 from zipwire._zipstructs import (
-    CentralDirHeaderRecord,
     LocalFileHeaderRecord,
 )
 
@@ -202,7 +207,7 @@ class TestSyncRemoteZip:
         with SyncRemoteZip(reader) as rz:
             names = rz.namelist()
         assert "\u00e9\u00e0\u00fc.txt" in names
-        assert "\u4f60\u597d/world.txt" in names
+        assert "€100/rates.txt" in names
 
     def test_empty_zip(self, empty_zip: bytes) -> None:
         reader = MockSyncReader(empty_zip)
@@ -443,20 +448,10 @@ class TestSyncRemoteZip:
             pass
 
 
-def _cd_entry_offset(data: bytes, index: int = 0) -> int:
-    """Absolute offset of central directory entry *index* in *data*."""
-    eocd = find_eocd(data, len(data))
-    offset = eocd.cd_offset
-    for _ in range(index):
-        fn_len, extra_len, comment_len = struct.unpack_from("<HHH", data, offset + 28)
-        offset += CentralDirHeaderRecord.FIXED_SIZE + fn_len + extra_len + comment_len
-    return offset
-
-
 def _or_cd_flags(data: bytes, mask: int, index: int = 0) -> bytes:
     """Set general purpose flag bits in central directory entry *index*."""
     buf = bytearray(data)
-    offset = _cd_entry_offset(data, index)
+    offset = cd_entry_offset(data, index)
     flags = struct.unpack_from("<H", buf, offset + 8)[0]
     struct.pack_into("<H", buf, offset + 8, flags | mask)
     return bytes(buf)
@@ -469,7 +464,7 @@ def _patch_local_filename(data: bytes, index: int, replacement: bytes) -> bytes:
     the local header layout stays intact.
     """
     buf = bytearray(data)
-    header_offset = struct.unpack_from("<I", buf, _cd_entry_offset(data, index) + 42)[0]
+    header_offset = struct.unpack_from("<I", buf, cd_entry_offset(data, index) + 42)[0]
     # Local file header: filename_len is at offset 26, unlike the
     # central directory entry where it is at 28.
     fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
@@ -554,7 +549,7 @@ class TestHardening:
 
     def test_header_offset_beyond_archive(self, stored_zip: bytes) -> None:
         buf = bytearray(stored_zip)
-        offset = _cd_entry_offset(stored_zip, 0)
+        offset = cd_entry_offset(stored_zip, 0)
         struct.pack_into("<I", buf, offset + 42, len(stored_zip) + 100)
         reader = MockSyncReader(bytes(buf))
         with (
@@ -567,7 +562,7 @@ class TestHardening:
         # Inflate compress_size so the data ends past the last byte of
         # the archive.
         buf = bytearray(stored_zip)
-        offset = _cd_entry_offset(stored_zip, 0)
+        offset = cd_entry_offset(stored_zip, 0)
         struct.pack_into("<I", buf, offset + 20, len(stored_zip))
         reader = MockSyncReader(bytes(buf))
         with SyncRemoteZip(reader) as rz, pytest.raises(BadZipFile, match="beyond the end"):
@@ -577,7 +572,7 @@ class TestHardening:
         # Inflate compress_size so the data runs past the next entry's
         # local header, but stays inside the archive.
         buf = bytearray(stored_zip)
-        offset = _cd_entry_offset(stored_zip, 0)
+        offset = cd_entry_offset(stored_zip, 0)
         struct.pack_into("<I", buf, offset + 20, 100)
         reader = MockSyncReader(bytes(buf))
         with SyncRemoteZip(reader) as rz, pytest.raises(BadZipFile, match="Overlapped entries"):
@@ -585,7 +580,7 @@ class TestHardening:
 
     def test_overlapped_entry_rejected_by_read_into(self, stored_zip: bytes) -> None:
         buf = bytearray(stored_zip)
-        offset = _cd_entry_offset(stored_zip, 0)
+        offset = cd_entry_offset(stored_zip, 0)
         struct.pack_into("<I", buf, offset + 20, 100)
         reader = MockSyncReader(bytes(buf))
         with (
@@ -599,8 +594,8 @@ class TestHardening:
         # names: zipfile raises BadZipFile because the names differ.
         data = make_zip({"one.txt": b"same data", "two.txt": b"same data"})
         buf = bytearray(data)
-        first_hoff = struct.unpack_from("<I", buf, _cd_entry_offset(data, 0) + 42)[0]
-        struct.pack_into("<I", buf, _cd_entry_offset(data, 1) + 42, first_hoff)
+        first_hoff = struct.unpack_from("<I", buf, cd_entry_offset(data, 0) + 42)[0]
+        struct.pack_into("<I", buf, cd_entry_offset(data, 1) + 42, first_hoff)
         reader = MockSyncReader(bytes(buf))
         with (
             SyncRemoteZip(reader) as rz,
@@ -618,8 +613,8 @@ class TestHardening:
             zf.writestr("dup.txt", b"same data")
         data = zbuf.getvalue()
         buf = bytearray(data)
-        first_hoff = struct.unpack_from("<I", buf, _cd_entry_offset(data, 0) + 42)[0]
-        struct.pack_into("<I", buf, _cd_entry_offset(data, 1) + 42, first_hoff)
+        first_hoff = struct.unpack_from("<I", buf, cd_entry_offset(data, 0) + 42)[0]
+        struct.pack_into("<I", buf, cd_entry_offset(data, 1) + 42, first_hoff)
         reader = MockSyncReader(bytes(buf))
         with (
             SyncRemoteZip(reader) as rz,
@@ -706,15 +701,27 @@ class TestHardening:
             rz.read("hello.txt")
 
     def test_unicode_local_name_mismatch_rejected(self, unicode_zip: bytes) -> None:
-        # For entries with the UTF-8 flag set, the central directory
-        # name is re-encoded as UTF-8 for the comparison.
+        # For entries with the UTF-8 flag set, the local header name is
+        # decoded as UTF-8 for the comparison.
         name = "éàü.txt"
-        encoded = name.encode("utf-8")
-        corrupted = _patch_local_filename(unicode_zip, 0, b"x" + encoded[1:])
+        corrupted = _patch_local_filename(unicode_zip, 0, ("É" + name[1:]).encode("utf-8"))
         reader = MockSyncReader(corrupted)
         with (
             SyncRemoteZip(reader) as rz,
             pytest.raises(BadZipFile, match="differ"),
+        ):
+            rz.read(name)
+
+    def test_undecodable_local_name_raises_decode_error(self, unicode_zip: bytes) -> None:
+        # The local header name is decoded for the comparison; bytes
+        # that do not decode in the central directory encoding
+        # propagate the UnicodeDecodeError.
+        name = "éàü.txt"
+        corrupted = _patch_local_filename(unicode_zip, 0, b"\xff" * len(name.encode()))
+        reader = MockSyncReader(corrupted)
+        with (
+            SyncRemoteZip(reader) as rz,
+            pytest.raises(UnicodeDecodeError),
         ):
             rz.read(name)
 
@@ -784,3 +791,68 @@ class TestHardening:
             pytest.raises(BadZipFile, match="filename fetch returned"),
         ):
             rz.read(name)
+
+
+class TestFilenameEncoding:
+    """``metadata_encoding`` for entries without the UTF-8 flag."""
+
+    def test_metadata_encoding(self) -> None:
+        # 'Ÿ' is 0x9F in CP1252 and a different character in CP437,
+        # so the name only decodes correctly with the override.
+        data = legacy_encoded_zip("naïve-Ÿ.txt", "cp1252")
+        reader = MockSyncReader(data)
+        with SyncRemoteZip(reader, metadata_encoding="cp1252") as rz:
+            assert rz.namelist() == ["naïve-Ÿ.txt"]
+            assert rz.read("naïve-Ÿ.txt") == b"legacy content"
+
+    def test_default_cp437_mojibake(self) -> None:
+        # Without the override the name decodes as CP437 and the
+        # CP1252 name is not found.
+        data = legacy_encoded_zip("naïve-Ÿ.txt", "cp1252")
+        reader = MockSyncReader(data)
+        with SyncRemoteZip(reader) as rz:
+            assert "naïve-Ÿ.txt" not in rz.namelist()
+            with pytest.raises(FileNotFoundInZip):
+                rz.getinfo("naïve-Ÿ.txt")
+
+    def test_metadata_encoding_local_name_mismatch(self) -> None:
+        # The local header name is decoded with metadata_encoding for
+        # the comparison.
+        raw = "naïve-Ÿ.txt".encode("cp1252")
+        corrupted = _patch_local_filename(
+            legacy_encoded_zip("naïve-Ÿ.txt", "cp1252"), 0, b"x" + raw[1:]
+        )
+        reader = MockSyncReader(corrupted)
+        with (
+            SyncRemoteZip(reader, metadata_encoding="cp1252") as rz,
+            pytest.raises(BadZipFile, match="differ"),
+        ):
+            rz.read("naïve-Ÿ.txt")
+
+    def test_metadata_encoding_lossy_roundtrip(self) -> None:
+        # U+2252 decodes from CP932 bytes 0x87 0x90 but re-encodes to
+        # 0x81 0xE0, so comparing against a re-encoded central
+        # directory name would reject a valid archive.  Both sides are
+        # decoded instead, as in zipfile.
+        data = legacy_encoded_zip("≒.txt", "cp932")
+        reader = MockSyncReader(data)
+        with SyncRemoteZip(reader, metadata_encoding="cp932") as rz:
+            assert rz.namelist() == ["≒.txt"]
+            assert rz.read("≒.txt") == b"legacy content"
+
+    def test_empty_metadata_encoding_means_cp437(self) -> None:
+        # Like zipfile's ``metadata_encoding or 'cp437'``, an empty
+        # string selects the CP437 default instead of raising
+        # LookupError.
+        data = legacy_encoded_zip("naïve.txt", "cp437")
+        reader = MockSyncReader(data)
+        with SyncRemoteZip(reader, metadata_encoding="") as rz:
+            assert rz.namelist() == ["naïve.txt"]
+            assert rz.read("naïve.txt") == b"legacy content"
+
+    def test_metadata_encoding_never_overrides_utf8_flag(self, unicode_zip: bytes) -> None:
+        # Bit 11 selects UTF-8 regardless of metadata_encoding, as in
+        # zipfile.
+        reader = MockSyncReader(unicode_zip)
+        with SyncRemoteZip(reader, metadata_encoding="cp1252") as rz:
+            assert "€100/rates.txt" in rz.namelist()

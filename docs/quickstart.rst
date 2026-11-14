@@ -221,6 +221,27 @@ Async variant:
 
    asyncio.run(main())
 
+Legacy filename encodings
+-------------------------
+
+Entry names are decoded as UTF-8 when the general purpose flag bit 11
+is set and as CP437 otherwise, as in the standard library's ``zipfile``.
+``SyncRemoteZip`` and ``AsyncRemoteZip`` accept a
+``metadata_encoding`` argument with the same semantics as
+``zipfile.ZipFile`` for entries without the flag:
+
+.. code-block:: python
+
+   from zipwire import SyncRemoteZip
+   from zipwire.backends import Urllib3Reader
+
+   reader = Urllib3Reader("https://archive.example/legacy.zip")
+   with SyncRemoteZip(reader, metadata_encoding="cp1252") as rz:
+       print(rz.namelist())
+
+The wheel classes do not expose the argument: they always decode entry
+names as UTF-8, as PEP 427 requires, even when the flag is missing.
+
 Passing a pre-configured client
 --------------------------------
 

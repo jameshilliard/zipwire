@@ -189,6 +189,22 @@ def test_decode_filename() -> None:
         record.decode_filename()
 
 
+@pytest.mark.parametrize("flags", [0, HeaderFlag.UTF8_FILENAME])
+def test_decode_filename_null_byte_rejected(flags: int) -> None:
+    # A null byte is not a legal character in a file name on any
+    # mainstream filesystem; zipfile truncates at it as a defense
+    # against virus tricks, zipwire rejects the record instead.
+    record = make_lfh(flags, b"evil\x00.txt")
+    with pytest.raises(BadZipFile, match="null byte"):
+        record.decode_filename()
+
+
+def test_cdh_decode_filename_null_byte_rejected() -> None:
+    record = make_cdh(filename=b"evil\x00.txt")
+    with pytest.raises(BadZipFile, match="null byte"):
+        record.decode_filename()
+
+
 @pytest.mark.parametrize(("record_size", "valid"), [(43, False), (44, True)])
 def test_zip64_eocd_record_size_validated(record_size, valid) -> None:
     """``record_size`` must cover the fixed part after the size field."""
@@ -251,7 +267,7 @@ def test_cdh_variables_past_end_rejected(zip_data, eocd_offset) -> None:
         CentralDirHeaderRecord.parse(bad, eocd.cd_offset)
 
 
-def make_cdh(extra: bytes = b"", **overrides) -> CentralDirHeaderRecord:
+def make_cdh(extra: bytes = b"", filename: bytes = b"", **overrides) -> CentralDirHeaderRecord:
     """A parsed central directory header with overridable fields."""
     values: dict[str, int] = {
         "version_made_by": 45,
@@ -272,9 +288,10 @@ def make_cdh(extra: bytes = b"", **overrides) -> CentralDirHeaderRecord:
         "header_offset": 0,
     }
     values.update(overrides)
+    values["filename_length"] = len(filename)
     values["extra_length"] = len(extra)
     header = b"PK\x01\x02" + struct.pack("<HHHHHHIIIHHHHHII", *values.values())
-    return CentralDirHeaderRecord.parse(header + extra)
+    return CentralDirHeaderRecord.parse(header + filename + extra)
 
 
 @pytest.mark.parametrize(

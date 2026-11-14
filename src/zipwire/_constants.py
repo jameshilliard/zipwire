@@ -71,6 +71,7 @@ class ExtraDataId(IntEnum):
     # POSZIP_4690 = 0x4690
     # EXTENDED_TIMESTAMP = 0x5455
     # BEOS = 0x6542
+    UNICODE_PATH = 0x7075
     # ASI_UNIX = 0x756E
     # INFOZIP_UNIX = 0x7855
     # INFOZIP_UNIX_VAR_SIZE = 0x7875

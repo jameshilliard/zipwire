@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import zipfile
 
 from zipwire._constants import ExtraDataId
 from zipwire._zipstructs import (
     CentralDirHeaderRecord,
+    UnicodePathExtraField,
     Zip64ExtendedInfo,
     find_extra_field,
 )
@@ -57,5 +59,17 @@ class RemoteZipInfo(zipfile.ZipInfo):
                 info.header_offset = zip64.header_offset
             if zip64.disk_start is not None:
                 info.volume = zip64.disk_start
+
+        # A matching Unicode Path field carries the UTF-8 form of a
+        # legacy-encoded name and replaces it; ``orig_filename`` keeps
+        # the central directory form for the local header name check.
+        field = find_extra_field(entry.extra, ExtraDataId.UNICODE_PATH)
+        if field is not None:
+            unicode_path = UnicodePathExtraField.resolve(field.data, entry.filename)
+            if unicode_path is not None:
+                name = unicode_path.name
+                if os.sep != "/" and os.sep in name:
+                    name = name.replace(os.sep, "/")
+                info.filename = name
 
         return info

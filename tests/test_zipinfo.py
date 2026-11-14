@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import struct
 import zipfile
+from zlib import crc32
 
 import pytest
 
@@ -106,7 +107,11 @@ class TestRemoteZipInfoCompat:
             assert ours.header_offset == stdlib.header_offset
 
 
-def make_cd_entry(extra: bytes = b"", **overrides: int) -> CentralDirHeaderRecord:
+def make_cd_entry(
+    extra: bytes = b"",
+    filename: bytes = b"",
+    **overrides: int,
+) -> CentralDirHeaderRecord:
     """A central directory header record with overridable fields."""
     values: dict[str, int] = {
         "version_made_by": 45,
@@ -127,9 +132,10 @@ def make_cd_entry(extra: bytes = b"", **overrides: int) -> CentralDirHeaderRecor
         "header_offset": 100,
     }
     values.update(overrides)
+    values["filename_length"] = len(filename)
     values["extra_length"] = len(extra)
     header = b"PK\x01\x02" + struct.pack("<HHHHHHIIIHHHHHII", *values.values())
-    return CentralDirHeaderRecord.parse(header + extra)
+    return CentralDirHeaderRecord.parse(header + filename + extra)
 
 
 def zip64_extra(payload: bytes) -> bytes:
@@ -187,3 +193,22 @@ class TestZip64Resolution:
         )
         with pytest.raises(BadZipFile, match="File size not found"):
             RemoteZipInfo._from_central_dir_entry(entry)
+
+
+def test_unicode_path_extra_field() -> None:
+    """A version 1 Unicode Path field with a matching CRC-32 renames the entry."""
+    raw = b"cafe.txt"
+    payload = struct.pack("<BI", 1, crc32(raw)) + "café.txt".encode()
+    extra = struct.pack("<HH", ExtraDataId.UNICODE_PATH, len(payload)) + payload
+    info = RemoteZipInfo._from_central_dir_entry(make_cd_entry(extra, filename=raw))
+    assert info.filename == "café.txt"
+    assert info.orig_filename == "cafe.txt"
+
+
+def test_unicode_path_null_byte_rejected() -> None:
+    """A null byte in a Unicode Path field name is rejected."""
+    raw = b"cafe.txt"
+    payload = struct.pack("<BI", 1, crc32(raw)) + "café.txt\0evil.txt".encode()
+    extra = struct.pack("<HH", ExtraDataId.UNICODE_PATH, len(payload)) + payload
+    with pytest.raises(BadZipFile, match="null byte"):
+        RemoteZipInfo._from_central_dir_entry(make_cd_entry(extra, filename=raw))

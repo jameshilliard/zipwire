@@ -10,19 +10,24 @@ releases; they are marked **BREAKING**.
 
 ### Added
 
-- `EOCDInfo` now carries the .ZIP file comment in a new `comment`
-  field. For archives with ZIP64 end records the comment comes from
-  the classic record, which is the only one that has it.
+- `EOCDInfo` now carries the .ZIP file comment in a new `comment` field,
+  taken from the classic end record for ZIP64 archives.
+- The Unicode Path extra field (0x7075) is now honored: a CRC-32-matched
+  version 1 field replaces the entry name with its UTF-8 form, as stdlib
+  `zipfile` does.
+
+### Security
+
+- A null byte in an entry name or a Unicode Path field name is now
+  rejected with `BadZipFile`; CPython's `zipfile` truncates such names
+  instead.
 
 ### Internal
 
-- The library and test suite are now type checked with pyrefly and mypy,
-  and type annotations were completed and improved throughout.
-- Replaced the hand-rolled EOCD, central directory, and local file header
-  unpacking with the declarative record types in `zipwire._zipstructs`.
-  `zipwire._constants` now holds only the integer bounds, fetch sizes,
-  and compression methods; record signatures, struct formats, and fixed
-  sizes are derived by the records themselves.
+- The library and test suite are now type checked with pyrefly and mypy.
+- EOCD, central directory, and local file header parsing now use the
+  declarative record types in `zipwire._zipstructs`; `zipwire._constants`
+  keeps only the integer bounds, fetch sizes, and compression methods.
 
 ## 0.5.0 - 2026-11-12
 

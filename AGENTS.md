@@ -99,6 +99,9 @@ The human contribution workflow (issues, pull requests, security reports) is in
   definitions; version headings stay plain text.
 - Write entries for users, one change per line, wrapped at 80 columns, and
   end each with a period.
+- Keep entries short: at most 2-3 wrapped lines each. State the change
+  and why it matters to a user; leave implementation details to the docs
+  and the pull request.
 - `CHANGELOG.md` must stay valid Markdown at the repository root:
   `docs/changelog.rst` includes it via MyST and the `Changelog` project URL in
   `pyproject.toml` points at it. Do not rename or move it.

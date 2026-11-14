@@ -12,8 +12,9 @@ extra fields, and the EOCD tail) require their variable parts to fit;
 the local file header loads them tolerantly, because readers fetch a
 window that may end inside the name.  The EOCD comment must fit the
 buffer, but data after it is tolerated, as in ``zipfile``.  Concatenated extra fields are
-walked with ``iter_extra_fields()`` and the ZIP64 extended information
-field is resolved with ``Zip64ExtendedInfo.resolve()``.
+walked with ``iter_extra_fields()``; the ZIP64 extended information
+field is resolved with ``Zip64ExtendedInfo.resolve()`` and the Unicode
+Path field with ``UnicodePathExtraField.resolve()``.
 
 Shared integer bounds live in ``zipwire._constants``.  All records
 operate on ``bytes`` - no IO.
@@ -25,6 +26,7 @@ import inspect
 import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, NewType, Self
+from zlib import crc32
 
 from zipwire._constants import MAX_UINT16, MAX_UINT32, HeaderFlag
 from zipwire._errors import BadZipFile
@@ -334,8 +336,14 @@ class CentralDirHeaderRecord(StructRecord):
         Raises:
             UnicodeDecodeError: If the file name is not valid in the
                 encoding.
+            BadZipFile: If the file name contains a null byte.  No
+                mainstream filesystem or archiver produces one; a
+                null byte is a hostile trick, not a name.
         """
-        return self.filename.decode(filename_encoding(self.flags, metadata_encoding))
+        name = self.filename.decode(filename_encoding(self.flags, metadata_encoding))
+        if "\0" in name:
+            raise BadZipFile(f"{self.NAME} file name contains a null byte")
+        return name
 
     def _load_variables(self, data: bytes, offset: int) -> None:
         start = offset + self._STRUCT.size
@@ -401,11 +409,15 @@ class LocalFileHeaderRecord(StructRecord):
         CP437, as in ``zipfile``.
 
         Raises:
-            BadZipFile: If the file name is not loaded.
+            BadZipFile: If the file name is not loaded or contains a
+                null byte.
         """
         if self.filename is None:
             raise BadZipFile(f"{self.NAME} file name is not loaded")
-        return self.filename.decode(filename_encoding(self.flags, metadata_encoding))
+        name = self.filename.decode(filename_encoding(self.flags, metadata_encoding))
+        if "\0" in name:
+            raise BadZipFile(f"{self.NAME} file name contains a null byte")
+        return name
 
     def _load_variables(self, data: bytes, offset: int) -> None:
         start = offset + self._STRUCT.size
@@ -522,3 +534,43 @@ class Zip64ExtendedInfo:
             header_offset=header_offset,
             disk_start=disk_start,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class UnicodePathExtraField:
+    """Unicode Path extra field (APPNOTE 4.6.9).
+
+    Carries the UTF-8 form of an entry name whose central directory
+    form is legacy-encoded, together with a version and the CRC-32 of
+    the raw central directory name that authenticates it.
+    """
+
+    name: str
+
+    @classmethod
+    def resolve(cls, data: bytes, filename: bytes) -> Self | None:
+        """Return the UTF-8 name for *filename*, if the field applies.
+
+        The field is honoured when it is version 1 and its CRC-32
+        matches the raw central directory name *filename*, as in
+        ``zipfile``.  ``None`` is returned when it does not apply or
+        carries an empty name, so the caller keeps the name decoded
+        from the central directory.
+
+        Raises:
+            BadZipFile: If the payload is too short for the version
+                and CRC-32, the name is not valid UTF-8, or the name
+                contains a null byte.
+        """
+        if len(data) < 5:
+            raise BadZipFile("Corrupt unicode path extra field (0x7075)")
+        version, name_crc = struct.unpack("<BI", data[:5])
+        if version != 1 or name_crc != crc32(filename):
+            return None
+        try:
+            name = data[5:].decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise BadZipFile("Corrupt unicode path extra field (0x7075): invalid utf-8") from e
+        if "\0" in name:
+            raise BadZipFile("Unicode path extra field (0x7075) name contains a null byte")
+        return cls(name) if name else None

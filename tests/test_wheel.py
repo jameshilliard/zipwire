@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import io
+import struct
 import zipfile
 
 import pytest
 
 from tests.conftest import MockAsyncReader, MockSyncReader
 from zipwire import AsyncRemoteWheel, SyncRemoteWheel
+from zipwire._constants import HeaderFlag
+from zipwire._errors import BadZipFile, UnsupportedFeature
+from zipwire._parser import find_eocd
 from zipwire._wheel import _dist_info_from_url
+from zipwire._zipstructs import CentralDirHeaderRecord, LocalFileHeaderRecord
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -117,6 +122,32 @@ class TestDeriveDistInfoPrefix:
 
 
 class TestSyncRemoteWheel:
+    def test_enter_closes_reader_on_load_failure(self) -> None:
+        url = "https://example.com/example_pkg-1.0.0-py3-none-any.whl"
+        reader = MockSyncReader(b"not a zip file", url=url)
+        with pytest.raises(BadZipFile), SyncRemoteWheel(reader):
+            pass
+        assert reader.closed
+
+    def test_metadata_encoding_not_exposed(self) -> None:
+        # Wheels always decode names as UTF-8 (PEP 427), so there is
+        # nothing to configure.
+        reader = MockSyncReader(b"")
+        with pytest.raises(TypeError, match="metadata_encoding"):
+            SyncRemoteWheel(reader, metadata_encoding="cp1252")  # type: ignore[call-arg]
+
+    def test_utf8_name_without_flag(self) -> None:
+        # PEP 427 mandates UTF-8 entry names even when general purpose
+        # flag bit 11 is not set.
+        raw = "café.txt".encode()
+        placeholder = "c" * len(raw)
+        data, filename = _make_wheel(extra_files={placeholder: b"content"})
+        data = data.replace(placeholder.encode(), raw)
+        assert data.count(raw) == 2  # local header and central directory
+        reader = MockSyncReader(data, url=f"https://example.com/{filename}")
+        with SyncRemoteWheel(reader) as whl:
+            assert whl.read("café.txt") == b"content"
+
     def test_basic(self) -> None:
         data, filename = _make_wheel()
         reader = MockSyncReader(data, url=f"https://example.com/{filename}")
@@ -215,6 +246,32 @@ class TestSyncRemoteWheel:
 
 
 class TestAsyncRemoteWheel:
+    async def test_aenter_closes_reader_on_load_failure(self) -> None:
+        url = "https://example.com/example_pkg-1.0.0-py3-none-any.whl"
+        reader = MockAsyncReader(b"not a zip file", url=url)
+        with pytest.raises(BadZipFile):
+            async with AsyncRemoteWheel(reader):
+                pass
+        assert reader.closed
+
+    async def test_metadata_encoding_not_exposed(self) -> None:
+        # Wheels always decode names as UTF-8 (PEP 427), so there is
+        # nothing to configure.
+        reader = MockAsyncReader(b"")
+        with pytest.raises(TypeError, match="metadata_encoding"):
+            AsyncRemoteWheel(reader, metadata_encoding="cp1252")  # type: ignore[call-arg]
+
+    async def test_utf8_name_without_flag(self) -> None:
+        # PEP 427 mandates UTF-8 entry names even when general purpose
+        # flag bit 11 is not set.
+        raw = "café.txt".encode()
+        placeholder = "c" * len(raw)
+        data, filename = _make_wheel(extra_files={placeholder: b"content"})
+        data = data.replace(placeholder.encode(), raw)
+        reader = MockAsyncReader(data, url=f"https://example.com/{filename}")
+        async with AsyncRemoteWheel(reader) as whl:
+            assert await whl.read("café.txt") == b"content"
+
     @pytest.mark.asyncio
     async def test_basic(self) -> None:
         data, filename = _make_wheel()
@@ -266,3 +323,131 @@ class TestAsyncRemoteWheel:
         async with AsyncRemoteWheel(reader) as whl:
             metadata = await whl.read(f"{whl.dist_info_dir}METADATA")
         assert b"Name: example_pkg" in metadata
+
+
+def _last_cd_entry_offset(data: bytes) -> int:
+    """Absolute offset of the last central directory entry in *data*."""
+    eocd = find_eocd(data, len(data))
+    offset = eocd.cd_offset
+    for _ in range(eocd.cd_entry_count - 1):
+        fn_len, extra_len, comment_len = struct.unpack_from("<HHH", data, offset + 28)
+        offset += CentralDirHeaderRecord.FIXED_SIZE + fn_len + extra_len + comment_len
+    return offset
+
+
+def _set_last_cd_flags(data: bytes, mask: int) -> bytes:
+    """Set general purpose flag bits on the last central directory entry."""
+    buf = bytearray(data)
+    offset = _last_cd_entry_offset(data)
+    flags = struct.unpack_from("<H", buf, offset + 8)[0]
+    struct.pack_into("<H", buf, offset + 8, flags | mask)
+    return bytes(buf)
+
+
+def _inflate_last_cd_compress_size(data: bytes, delta: int) -> bytes:
+    """Grow the last central directory entry's compress_size by *delta*."""
+    buf = bytearray(data)
+    offset = _last_cd_entry_offset(data)
+    csize = struct.unpack_from("<I", buf, offset + 20)[0]
+    struct.pack_into("<I", buf, offset + 20, csize + delta)
+    return bytes(buf)
+
+
+def _last_local_header_offset(data: bytes) -> int:
+    """Absolute offset of the last entry's local file header in *data*."""
+    return struct.unpack_from("<I", data, _last_cd_entry_offset(data) + 42)[0]
+
+
+def _flip_last_local_filename_byte(data: bytes) -> bytes:
+    """Flip the last byte of the last entry's local header filename."""
+    buf = bytearray(data)
+    header_offset = _last_local_header_offset(data)
+    # Local file header: filename_len is at offset 26.
+    fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
+    pos = header_offset + LocalFileHeaderRecord.FIXED_SIZE + fn_len - 1
+    buf[pos] ^= 1
+    return bytes(buf)
+
+
+def _set_last_local_filename_length(data: bytes, fn_len: int) -> bytes:
+    """Overwrite the last entry's local header filename_len field."""
+    buf = bytearray(data)
+    header_offset = _last_local_header_offset(data)
+    struct.pack_into("<H", buf, header_offset + 26, fn_len)
+    return bytes(buf)
+
+
+class TestWheelHardening:
+    """The wheel tail-buffer fast path applies the same entry checks."""
+
+    def test_encrypted_entry_rejected(self) -> None:
+        """Encrypted dist-info entry is rejected when served from the tail."""
+        data, filename = _make_wheel()
+        reader = MockSyncReader(
+            _set_last_cd_flags(data, HeaderFlag.ENCRYPTED),
+            url=f"https://example.com/{filename}",
+        )
+        with (
+            SyncRemoteWheel(reader) as whl,
+            pytest.raises(UnsupportedFeature, match="encrypted"),
+        ):
+            whl.read(f"{whl.dist_info_dir}RECORD")
+
+    def test_overlapped_entry_rejected(self) -> None:
+        """Entry data overlapping the central directory is rejected."""
+        data, filename = _make_wheel()
+        # Inflate RECORD's compress_size just enough to cross into the
+        # central directory, which is the boundary for the last entry,
+        # but stay inside the archive.
+        corrupted = _inflate_last_cd_compress_size(data, 30)
+        reader = MockSyncReader(corrupted, url=f"https://example.com/{filename}")
+        with (
+            SyncRemoteWheel(reader) as whl,
+            pytest.raises(BadZipFile, match="Overlapped entries"),
+        ):
+            whl.read(f"{whl.dist_info_dir}RECORD")
+
+    @pytest.mark.asyncio
+    async def test_async_overlapped_entry_rejected(self) -> None:
+        data, filename = _make_wheel()
+        corrupted = _inflate_last_cd_compress_size(data, 30)
+        reader = MockAsyncReader(corrupted, url=f"https://example.com/{filename}")
+        async with AsyncRemoteWheel(reader) as whl:
+            with pytest.raises(BadZipFile, match="Overlapped entries"):
+                await whl.read(f"{whl.dist_info_dir}RECORD")
+
+    def test_local_name_mismatch_rejected(self) -> None:
+        """A tail-served entry whose local header name differs is rejected."""
+        # Enough entries for a >1 KiB central directory, so RECORD (the
+        # last file) is covered by the tail fast path.
+        extra_files = {f"mod{i}.py": b"x = 1\n" for i in range(15)}
+        data, filename = _make_wheel(extra_files=extra_files)
+        corrupted = _flip_last_local_filename_byte(data)
+        reader = MockSyncReader(corrupted, url=f"https://example.com/{filename}")
+        with (
+            SyncRemoteWheel(reader) as whl,
+            pytest.raises(BadZipFile, match="differ"),
+        ):
+            whl.read(f"{whl.dist_info_dir}RECORD")
+
+    def test_lying_local_filename_length_rejected(self) -> None:
+        """A local header that claims a huge filename falls back from the
+        tail fast path and is rejected by the regular bounds check."""
+        extra_files = {f"mod{i}.py": b"x = 1\n" for i in range(15)}
+        data, filename = _make_wheel(extra_files=extra_files)
+        corrupted = _set_last_local_filename_length(data, 0xFFFF)
+        reader = MockSyncReader(corrupted, url=f"https://example.com/{filename}")
+        with (
+            SyncRemoteWheel(reader) as whl,
+            pytest.raises(BadZipFile, match="beyond the end"),
+        ):
+            whl.read(f"{whl.dist_info_dir}RECORD")
+
+    def test_long_dist_info_name_checked(self) -> None:
+        """A dist-info name longer than the tail allowance is still
+        validated and read correctly from the tail buffer."""
+        data, filename = _make_wheel(name="a" * 1100)
+        reader = MockSyncReader(data, url=f"https://example.com/{filename}")
+        with SyncRemoteWheel(reader) as whl:
+            metadata = whl.read(whl.metadata_name)
+        assert b"Name:" in metadata

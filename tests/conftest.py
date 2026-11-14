@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 import io
+import struct
 import typing
 import zipfile
 from importlib.util import find_spec
 
 import pytest
 
+from zipwire._parser import find_eocd
+from zipwire._zipstructs import CentralDirHeaderRecord, LocalFileHeaderRecord
+
 has_httpx2 = find_spec("httpx2") is not None
 has_requests = find_spec("requests") is not None
 has_aiohttp = find_spec("aiohttp") is not None
+has_anyio = find_spec("anyio") is not None
+has_aiobotocore = find_spec("aiobotocore") is not None
 has_zstd = find_spec("compression") is not None and find_spec("compression.zstd") is not None
 
 needs_httpx2 = pytest.mark.skipif(not has_httpx2, reason="httpx2 not installed")
 needs_requests = pytest.mark.skipif(not has_requests, reason="requests not installed")
 needs_aiohttp = pytest.mark.skipif(not has_aiohttp, reason="aiohttp not installed")
+needs_anyio = pytest.mark.skipif(not has_anyio, reason="anyio not installed")
+needs_aiobotocore = pytest.mark.skipif(not has_aiobotocore, reason="aiobotocore not installed")
 needs_zstd = pytest.mark.skipif(not has_zstd, reason="compression.zstd not available")
 
 
@@ -25,7 +33,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--all-backends",
         action="store_true",
         default=False,
-        help="Assert that all optional backends (httpx2, requests, aiohttp) are installed.",
+        help="Assert that all optional backends are installed.",
     )
 
 
@@ -38,6 +46,8 @@ def pytest_configure(config: pytest.Config) -> None:
             missing.append("requests")
         if not has_aiohttp:
             missing.append("aiohttp")
+        if not has_aiobotocore:
+            missing.append("aiobotocore")
         if missing:
             raise pytest.UsageError(
                 f"--all-backends: missing optional backends: {', '.join(missing)}"
@@ -45,7 +55,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 if typing.TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncGenerator, Generator
 
 
 def make_zip(files: dict[str, bytes], *, compression: int = zipfile.ZIP_STORED) -> bytes:
@@ -65,6 +75,58 @@ def make_zip(files: dict[str, bytes], *, compression: int = zipfile.ZIP_STORED) 
     return buf.getvalue()
 
 
+def cd_entry_offset(data: bytes, index: int = 0) -> int:
+    """Absolute offset of central directory entry *index* in *data*."""
+    eocd = find_eocd(data, len(data))
+    offset = eocd.cd_offset
+    for _ in range(index):
+        fn_len, extra_len, comment_len = struct.unpack_from("<HHH", data, offset + 28)
+        offset += CentralDirHeaderRecord.FIXED_SIZE + fn_len + extra_len + comment_len
+    return offset
+
+
+def legacy_encoded_zip(name: str, encoding: str, content: bytes = b"legacy content") -> bytes:
+    """A single-entry ZIP whose entry name is encoded with a legacy codec.
+
+    The archive is written with an ASCII placeholder of the same byte
+    length, then the raw *encoding* bytes are patched into the local
+    file header and the central directory, leaving the UTF-8 flag
+    unset so the name decodes as CP437 by default.
+    """
+    raw = name.encode(encoding)
+    data = make_zip({"l" * len(raw): content})
+    buf = bytearray(data)
+    cd_off = cd_entry_offset(data)
+    cd_fixed = CentralDirHeaderRecord.FIXED_SIZE
+    buf[cd_off + cd_fixed : cd_off + cd_fixed + len(raw)] = raw
+    header_offset = struct.unpack_from("<I", buf, cd_off + 42)[0]
+    lfh_fixed = LocalFileHeaderRecord.FIXED_SIZE
+    buf[header_offset + lfh_fixed : header_offset + lfh_fixed + len(raw)] = raw
+    return bytes(buf)
+
+
+class MockHeaders:
+    """Lower-case header mapping for mock readers.
+
+    A plain dict would work at runtime, but pyrefly cannot match the
+    overloaded ``get`` of the mapping types against the Headers protocol;
+    declaring the protocol's signatures directly makes the mock readers
+    verify against SyncReader and AsyncReader.
+    """
+
+    def __init__(self, headers: dict[str, str] | None = None) -> None:
+        self._headers: dict[str, str] = dict(headers) if headers else {}
+
+    def __getitem__(self, key: str, /) -> str:
+        return self._headers[key]
+
+    def __contains__(self, key: object, /) -> bool:
+        return key in self._headers
+
+    def get(self, key: str, default: str | None = None, /) -> str | None:
+        return self._headers.get(key, default)
+
+
 class MockSyncReader:
     """A SyncReader backed by in-memory bytes (simulates a remote ZIP)."""
 
@@ -72,31 +134,35 @@ class MockSyncReader:
         self.data = data
         self.closed = False
         self.read_count = 0
+        self.requests: list[tuple[int, int]] = []
         self._url = url
 
     @property
     def url(self) -> str:
         return self._url
 
-    def head(self) -> dict[str, str]:
-        return {
-            "content-length": str(len(self.data)),
-            "accept-ranges": "bytes",
-        }
+    def head(self) -> MockHeaders:
+        return MockHeaders(
+            {
+                "content-length": str(len(self.data)),
+                "accept-ranges": "bytes",
+            }
+        )
 
     def read_range(
         self,
         offset: int,
         length: int,
-    ) -> tuple[bytes, dict[str, str]]:
+    ) -> tuple[bytes, MockHeaders]:
         self.read_count += 1
+        self.requests.append((offset, length))
         total = len(self.data)
         chunk = self.data[offset : offset + length]
         end = offset + len(chunk) - 1
-        headers = {"content-range": f"bytes {offset}-{end}/{total}"}
+        headers = MockHeaders({"content-range": f"bytes {offset}-{end}/{total}"})
         return chunk, headers
 
-    def stream_range(self, offset: int, length: int) -> Iterator[bytes]:
+    def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
         data = self.data[offset : offset + length]
         chunk_size = 1024
         for pos in range(0, len(data), chunk_size):
@@ -114,31 +180,35 @@ class MockAsyncReader:
         self.data = data
         self.closed = False
         self.read_count = 0
+        self.requests: list[tuple[int, int]] = []
         self._url = url
 
     @property
     def url(self) -> str:
         return self._url
 
-    async def head(self) -> dict[str, str]:
-        return {
-            "content-length": str(len(self.data)),
-            "accept-ranges": "bytes",
-        }
+    async def head(self) -> MockHeaders:
+        return MockHeaders(
+            {
+                "content-length": str(len(self.data)),
+                "accept-ranges": "bytes",
+            }
+        )
 
     async def read_range(
         self,
         offset: int,
         length: int,
-    ) -> tuple[bytes, dict[str, str]]:
+    ) -> tuple[bytes, MockHeaders]:
         self.read_count += 1
+        self.requests.append((offset, length))
         total = len(self.data)
         chunk = self.data[offset : offset + length]
         end = offset + len(chunk) - 1
-        headers = {"content-range": f"bytes {offset}-{end}/{total}"}
+        headers = MockHeaders({"content-range": f"bytes {offset}-{end}/{total}"})
         return chunk, headers
 
-    async def stream_range(self, offset: int, length: int) -> AsyncIterator[bytes]:
+    async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
         data = self.data[offset : offset + length]
         chunk_size = 1024
         for pos in range(0, len(data), chunk_size):
@@ -200,7 +270,7 @@ def unicode_zip() -> bytes:
     return make_zip(
         {
             "\u00e9\u00e0\u00fc.txt": b"unicode content",
-            "\u4f60\u597d/world.txt": b"hello",
+            "\u20ac100/rates.txt": b"hello",
         }
     )
 
@@ -228,6 +298,21 @@ def comment_zip() -> bytes:
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("file.txt", b"content")
         zf.comment = b"This is a ZIP comment"
+    return buf.getvalue()
+
+
+@pytest.fixture(scope="session")
+def zip64_zip() -> bytes:
+    """ZIP with more than 65535 entries, forcing ZIP64 end records.
+
+    Built once per session; the entry count overflows the classic
+    EOCD's 16-bit field, so the archive carries a ZIP64 EOCD record
+    and locator with sentinel values in the classic record.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for i in range(65536 + 3):
+            zf.writestr(f"f{i}.txt", b"x")
     return buf.getvalue()
 
 

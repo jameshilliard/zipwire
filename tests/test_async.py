@@ -2,15 +2,40 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
+import struct
+import typing
 import zipfile
+import zlib
 
 import pytest
 
-from tests.conftest import MockAsyncReader
+from tests.conftest import (
+    MockAsyncReader,
+    MockHeaders,
+    legacy_encoded_zip,
+    make_zip,
+)
 from zipwire import AsyncRemoteZip, EOCDInfo
-from zipwire._errors import FileNotFoundInZip, FileTooLarge, RangeRequestUnsupported
+from zipwire._constants import STREAM_CHUNK_SIZE
+from zipwire._errors import (
+    BadZipFile,
+    FileNotFoundInZip,
+    FileTooLarge,
+    RangeRequestUnsupported,
+)
+from zipwire._parser import find_eocd
 from zipwire._zipinfo import RemoteZipInfo
+from zipwire._zipstructs import LocalFileHeaderRecord
+
+if typing.TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
+
+class FailingWriter:
+    def write(self, data: bytes) -> None:
+        raise OSError("destination write failed")
 
 
 class TestAsyncRemoteZip:
@@ -95,6 +120,26 @@ class TestAsyncRemoteZip:
             rz.namelist()
         assert reader.closed
 
+    async def test_aenter_closes_reader_on_load_failure(self) -> None:
+        reader = MockAsyncReader(b"not a zip file")
+        with pytest.raises(BadZipFile):
+            async with AsyncRemoteZip(reader):
+                pass
+        assert reader.closed
+
+    async def test_aenter_close_error_chains(self) -> None:
+        """A failing reader close() chains the load error as context."""
+
+        class FailingCloseReader(MockAsyncReader):
+            async def close(self) -> None:
+                raise OSError("close failed")
+
+        reader = FailingCloseReader(b"not a zip file")
+        with pytest.raises(OSError, match="close failed") as excinfo:
+            async with AsyncRemoteZip(reader):
+                pass
+        assert isinstance(excinfo.value.__context__, BadZipFile)
+
     async def test_file_size(self, stored_zip: bytes) -> None:
         reader = MockAsyncReader(stored_zip)
         async with AsyncRemoteZip(reader) as rz:
@@ -108,6 +153,7 @@ class TestAsyncRemoteZip:
         assert eocd.cd_entry_count == 2
         assert eocd.cd_size > 0
         assert 0 <= eocd.cd_offset < len(stored_zip)
+        assert eocd.comment == b""
 
     async def test_url(self, stored_zip: bytes) -> None:
         reader = MockAsyncReader(stored_zip, url="https://example.com/archive.zip")
@@ -150,7 +196,7 @@ class TestAsyncRemoteZip:
         async with AsyncRemoteZip(reader) as rz:
             names = rz.namelist()
         assert "\u00e9\u00e0\u00fc.txt" in names
-        assert "\u4f60\u597d/world.txt" in names
+        assert "€100/rates.txt" in names
 
     async def test_empty_zip(self, empty_zip: bytes) -> None:
         reader = MockAsyncReader(empty_zip)
@@ -259,6 +305,158 @@ class TestAsyncRemoteZip:
             await rz.read_into("large.bin", dest)
         assert dest.getvalue() == expected
 
+    async def test_read_into_bounded_output_chunks(self) -> None:
+        """Decoded output reaches the destination in bounded chunks."""
+        content = b"\0" * (2 * STREAM_CHUNK_SIZE + 123)
+        sizes: list[int] = []
+        output = bytearray()
+
+        class Destination:
+            def write(self, chunk: bytes) -> int:
+                sizes.append(len(chunk))
+                output.extend(chunk)
+                return len(chunk)
+
+        archive_data = make_zip({"entry.bin": content}, compression=zipfile.ZIP_DEFLATED)
+        async with AsyncRemoteZip(MockAsyncReader(archive_data)) as rz:
+            await rz.read_into("entry.bin", Destination())
+        assert bytes(output) == content
+        assert max(sizes) <= STREAM_CHUNK_SIZE
+
+    def test_read_into_is_loop_agnostic(self) -> None:
+        """read_into must not use event-loop primitives such as asyncio.sleep(0).
+
+        A checkpoint like asyncio.sleep(0) passes under asyncio but raises
+        RuntimeError on other event loops such as trio.  Driving the
+        coroutine by hand, with no event loop at all, detects any await
+        that needs one: the extraction must run to completion without ever
+        suspending, for both sync and async destinations.
+        """
+        content = b"\0" * (3 * STREAM_CHUNK_SIZE)
+
+        class SyncDestination:
+            def __init__(self) -> None:
+                self.data = bytearray()
+
+            def write(self, chunk: bytes) -> int:
+                self.data.extend(chunk)
+                return len(chunk)
+
+        class AsyncDestination:
+            def __init__(self) -> None:
+                self.data = bytearray()
+
+            async def write(self, chunk: bytes) -> int:
+                self.data.extend(chunk)
+                return len(chunk)
+
+        archive_data = make_zip({"entry.bin": content}, compression=zipfile.ZIP_DEFLATED)
+        for destination in (SyncDestination(), AsyncDestination()):
+            coroutine = self._extract(archive_data, destination)
+            try:
+                coroutine.send(None)
+            except StopIteration:
+                pass
+            else:
+                coroutine.close()
+                pytest.fail("read_into suspended on an event-loop primitive")
+            assert bytes(destination.data) == content
+
+    @staticmethod
+    async def _extract(archive_data: bytes, destination: typing.Any) -> None:
+        async with AsyncRemoteZip(MockAsyncReader(archive_data)) as rz:
+            await rz.read_into("entry.bin", destination)
+
+    async def test_read_into_closes_stream_on_error(self, large_file_zip: bytes) -> None:
+        """Close the response generator when writing fails mid-stream."""
+
+        class ClosingReader(MockAsyncReader):
+            stream_closed = False
+
+            async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
+                try:
+                    async for chunk in super().stream_range(offset, length):
+                        yield chunk
+                finally:
+                    self.stream_closed = True
+
+        class FailingDest:
+            def write(self, data: bytes) -> None:
+                raise OSError("write failed")
+
+        reader = ClosingReader(large_file_zip)
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(OSError, match="write failed"):
+                await rz.read_into("large.bin", FailingDest())
+        assert reader.stream_closed
+
+    async def test_read_into_close_error_chains(self, large_file_zip: bytes) -> None:
+        """A failing stream aclose() masks the extraction error.
+
+        Unlike the sync path, the original error is not reachable in
+        the exception chain here: the async generator machinery drops
+        it when aclose() raises.
+        """
+
+        class FailingCloseReader(MockAsyncReader):
+            async def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
+                try:
+                    async for chunk in super().stream_range(offset, length):
+                        yield chunk
+                finally:
+                    raise OSError("close failed")
+
+        class FailingDest:
+            def write(self, data: bytes) -> None:
+                raise OSError("write failed")
+
+        reader = FailingCloseReader(large_file_zip)
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(OSError, match="close failed"):
+                await rz.read_into("large.bin", FailingDest())
+
+    @pytest.mark.parametrize("failure", ["write", "decompress", "size_limit"])
+    async def test_read_into_failure_closes_stream(
+        self, large_file_zip: bytes, monkeypatch: pytest.MonkeyPatch, failure: str
+    ) -> None:
+        reader = MockAsyncReader(large_file_zip)
+        closed = False
+
+        async def chunks(offset: int, length: int) -> AsyncGenerator[bytes, None]:
+            nonlocal closed
+            try:
+                yield reader.data[offset : offset + length]
+            finally:
+                await asyncio.sleep(0)
+                closed = True
+
+        async with AsyncRemoteZip(reader) as rz:
+            info = rz.getinfo("large.bin")
+            offset = info.header_offset + len(info.FileHeader())
+            # Retain the generator so collection cannot hide missing cleanup.
+            stream = chunks(offset, info.compress_size)
+            monkeypatch.setattr(reader, "stream_range", lambda offset, length: stream)
+            error: type[Exception]
+            if failure == "decompress":
+                info.compress_type = zipfile.ZIP_DEFLATED
+                error = zlib.error
+            elif failure == "size_limit":
+                info.file_size = 0  # Force the limit to be checked during streaming.
+                error = FileTooLarge
+            else:
+                error = OSError
+            try:
+                with pytest.raises(error):
+                    await rz.read_into(
+                        info,
+                        FailingWriter() if failure == "write" else io.BytesIO(),
+                        max_file_size=1 if failure == "size_limit" else None,
+                    )
+                assert closed
+                assert not reader.closed
+            finally:
+                await stream.aclose()
+
     async def test_read_zstandard(self, zstandard_zip: bytes) -> None:
         reader = MockAsyncReader(zstandard_zip)
         async with AsyncRemoteZip(reader) as rz:
@@ -289,10 +487,165 @@ class TestAsyncRemoteZip:
     async def test_no_content_length(self, stored_zip: bytes) -> None:
         reader = MockAsyncReader(stored_zip)
 
-        async def _head_no_cl() -> dict[str, str]:
-            return {"accept-ranges": "bytes"}
+        async def _head_no_cl() -> MockHeaders:
+            return MockHeaders({"accept-ranges": "bytes"})
 
-        reader.head = _head_no_cl
+        reader.head = _head_no_cl  # type: ignore[method-assign]
         with pytest.raises(RangeRequestUnsupported, match="Content-Length"):
             async with AsyncRemoteZip(reader):
                 pass
+
+
+class ShortTailAsyncReader(MockAsyncReader):
+    """Reader whose first (tail) read_range returns one byte too few."""
+
+    async def read_range(
+        self,
+        offset: int,
+        length: int,
+    ) -> tuple[bytes, MockHeaders]:
+        data, headers = await super().read_range(offset, length)
+        if self.read_count == 1:
+            data = data[:-1]
+        return data, headers
+
+
+class ShortFilenameAsyncReader(MockAsyncReader):
+    """Reader whose fourth (local header filename) read_range is short."""
+
+    async def read_range(
+        self,
+        offset: int,
+        length: int,
+    ) -> tuple[bytes, MockHeaders]:
+        data, headers = await super().read_range(offset, length)
+        if self.read_count == 4:
+            data = data[:-1]
+        return data, headers
+
+
+class TestHardening:
+    """Admission and bounds checks ported from zipfile (async path)."""
+
+    @pytest.mark.parametrize("method", ["read", "read_into"])
+    async def test_local_name_mismatch_rejected(self, stored_zip: bytes, method: str) -> None:
+        # The local header names a different member than the central
+        # directory ("zip confusion"); rejected like zipfile does.
+        buf = bytearray(stored_zip)
+        eocd = find_eocd(stored_zip, len(stored_zip))
+        header_offset = struct.unpack_from("<I", buf, eocd.cd_offset + 42)[0]
+        # Local file header: filename_len is at offset 26.
+        fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
+        start = header_offset + LocalFileHeaderRecord.FIXED_SIZE
+        buf[start : start + fn_len] = b"hello.txX"
+        reader = MockAsyncReader(bytes(buf))
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(BadZipFile, match="differ"):
+                if method == "read":
+                    await rz.read("hello.txt")
+                else:
+                    await rz.read_into("hello.txt", io.BytesIO())
+
+    async def test_long_local_name_fetched_for_check(self) -> None:
+        # A local filename longer than the PREFETCH_EXTRA allowance is
+        # fetched with an extra range request and must still match.
+        name = "l" * 1200 + ".txt"
+        data = make_zip({name: b"long name content"})
+        reader = MockAsyncReader(data)
+        async with AsyncRemoteZip(reader) as rz:
+            assert await rz.read(name) == b"long name content"
+        assert (LocalFileHeaderRecord.FIXED_SIZE, len(name)) in reader.requests
+
+    async def test_long_local_name_mismatch_rejected(self) -> None:
+        # A mismatching local filename must not slip past the check just
+        # because it is longer than the prefetch allowance.
+        name = "l" * 1200 + ".txt"
+        data = make_zip({name: b"long name content"})
+        buf = bytearray(data)
+        header_offset = 0
+        fn_len = struct.unpack_from("<H", buf, header_offset + 26)[0]
+        start = header_offset + LocalFileHeaderRecord.FIXED_SIZE
+        buf[start : start + fn_len] = ("L" + name[1:]).encode()
+        reader = MockAsyncReader(bytes(buf))
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(BadZipFile, match="differ"):
+                await rz.read(name)
+
+    async def test_overlapped_entry_rejected(self, stored_zip: bytes) -> None:
+        # Inflate compress_size so the data runs past the next entry's
+        # local header, but stays inside the archive.
+        buf = bytearray(stored_zip)
+        eocd = find_eocd(stored_zip, len(stored_zip))
+        struct.pack_into("<I", buf, eocd.cd_offset + 20, 100)
+        reader = MockAsyncReader(bytes(buf))
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(BadZipFile, match="Overlapped entries"):
+                await rz.read("hello.txt")
+
+    async def test_cd_bounds_checked_before_fetch(self, stored_zip: bytes) -> None:
+        # A hostile cd_size must not become a range request: only the
+        # initial tail fetch is allowed before the archive is rejected.
+        buf = bytearray(stored_zip)
+        eocd_pos = buf.rfind(b"PK\x05\x06")
+        struct.pack_into("<I", buf, eocd_pos + 12, 0xFFFFFF00)
+        data = bytes(buf)
+        reader = MockAsyncReader(data)
+        with pytest.raises(BadZipFile, match="beyond the end of the archive"):
+            async with AsyncRemoteZip(reader):
+                pass
+        assert reader.requests == [(0, len(data))]
+
+    async def test_prefetch_fetch_stays_in_bounds(self, stored_zip: bytes) -> None:
+        # A lying compress_size below the prefetch threshold must not
+        # become a range request past the end of the archive either.
+        buf = bytearray(stored_zip)
+        eocd = find_eocd(stored_zip, len(stored_zip))
+        struct.pack_into("<I", buf, eocd.cd_offset + 20, 5000)
+        data = bytes(buf)
+        reader = MockAsyncReader(data)
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(BadZipFile, match="beyond the end of the archive"):
+                await rz.read("hello.txt")
+        assert all(offset + length <= len(data) for offset, length in reader.requests)
+
+    async def test_cd_beyond_archive_rejected_on_load(self, stored_zip: bytes) -> None:
+        buf = bytearray(stored_zip)
+        eocd_pos = buf.rfind(b"PK\x05\x06")
+        cd_offset = struct.unpack_from("<I", buf, eocd_pos + 16)[0]
+        struct.pack_into("<I", buf, eocd_pos + 16, cd_offset + 1000)
+        reader = MockAsyncReader(bytes(buf))
+        with pytest.raises(BadZipFile, match="beyond the end of the archive"):
+            async with AsyncRemoteZip(reader):
+                pass
+
+    async def test_short_tail_read_rejected(self, stored_zip: bytes) -> None:
+        reader = ShortTailAsyncReader(stored_zip)
+        with pytest.raises(BadZipFile, match="tail fetch returned"):
+            async with AsyncRemoteZip(reader):
+                pass
+
+    async def test_short_local_filename_fetch_rejected(self) -> None:
+        # The extra fetch for a filename longer than the prefetch
+        # allowance must return every byte it asked for.
+        name = "l" * 1200 + ".txt"
+        data = make_zip({name: b"long name content"})
+        reader = ShortFilenameAsyncReader(data)
+        async with AsyncRemoteZip(reader) as rz:
+            with pytest.raises(BadZipFile, match="filename fetch returned"):
+                await rz.read(name)
+
+
+class TestFilenameEncoding:
+    """``metadata_encoding`` for entries without the UTF-8 flag."""
+
+    async def test_metadata_encoding(self) -> None:
+        data = legacy_encoded_zip("naïve-Ÿ.txt", "cp1252")
+        reader = MockAsyncReader(data)
+        async with AsyncRemoteZip(reader, metadata_encoding="cp1252") as rz:
+            assert rz.namelist() == ["naïve-Ÿ.txt"]
+            assert await rz.read("naïve-Ÿ.txt") == b"legacy content"
+
+    async def test_metadata_encoding_never_overrides_utf8_flag(self, unicode_zip: bytes) -> None:
+        reader = MockAsyncReader(unicode_zip)
+        async with AsyncRemoteZip(reader, metadata_encoding="cp1252") as rz:
+            assert "€100/rates.txt" in rz.namelist()

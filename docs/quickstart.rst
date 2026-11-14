@@ -34,7 +34,11 @@ Stream a file to disk
 
 :meth:`~zipwire.SyncRemoteZip.read_into` streams the compressed payload in
 chunks and decompresses on the fly, keeping peak memory low even for large
-entries:
+entries.  Decoded output is passed to the destination in chunks of at most
+2 MiB, so a highly compressible entry cannot inflate into a single large
+allocation.  Partial writes are retried, so raw unbuffered streams work as
+destinations.  A destination's ``write()`` must return the number of bytes
+accepted, or ``None`` for the whole chunk:
 
 .. code-block:: python
 
@@ -108,6 +112,38 @@ Async with httpx2
 
    asyncio.run(main())
 
+Async S3 archive
+^^^^^^^^^^^^^^^^
+
+Install ``zipwire[aiobotocore]``. Supply an open S3 client so the application
+controls its credentials, endpoint, retries, and HTTP transport:
+
+.. code-block:: python
+
+   import asyncio
+
+   from aiobotocore.session import get_session
+
+   from zipwire import AsyncRemoteZip
+   from zipwire.backends import AiobotocoreReader
+
+
+   async def main():
+       async with get_session().create_client("s3") as client:
+           reader = AiobotocoreReader("my-bucket", "archives/data.zip", client=client)
+           async with AsyncRemoteZip(reader) as rz:
+               print(rz.namelist())
+               data = await rz.read("file.txt")
+               print(data.decode())
+
+
+   asyncio.run(main())
+
+The reader closes response bodies but leaves the client open. Its range
+requests check the object's ETag so an overwrite during extraction raises
+an error. Pass ``extra_args={"VersionId": "..."}`` to select a version;
+see :doc:`backends` for requester-pays and encryption options.
+
 Async local archive
 ^^^^^^^^^^^^^^^^^^^
 
@@ -144,6 +180,33 @@ Async streaming to disk
        reader = AiohttpReader("https://archive.example/large.zip")
        async with AsyncRemoteZip(reader) as rz:
            with open("output.bin", "wb") as f:
+               await rz.read_into("big-file.bin", f)
+
+
+   asyncio.run(main())
+
+:meth:`~zipwire.AsyncRemoteZip.read_into` also accepts asynchronous
+writable objects, such as ``anyio.AsyncFile``.  When ``write()`` returns
+an awaitable, zipwire waits for that write to finish before it reads more
+input, so a slow destination throttles the download.  Partial writes are
+retried in both modes, and a byte count that is not an integer, or is zero,
+negative, or oversized, raises ``OSError``.  Any object with an awaitable
+``write()`` works; the example uses anyio:
+
+.. code-block:: python
+
+   import asyncio
+
+   import anyio
+
+   from zipwire import AsyncRemoteZip
+   from zipwire.backends import AiohttpReader
+
+
+   async def main():
+       reader = AiohttpReader("https://archive.example/large.zip")
+       async with AsyncRemoteZip(reader) as rz:
+           async with await anyio.open_file("output.bin", "wb") as f:
                await rz.read_into("big-file.bin", f)
 
 
@@ -190,10 +253,32 @@ Async variant:
 
    asyncio.run(main())
 
+Legacy filename encodings
+-------------------------
+
+Entry names are decoded as UTF-8 when the general purpose flag bit 11
+is set and as CP437 otherwise, as in the standard library's ``zipfile``.
+``SyncRemoteZip`` and ``AsyncRemoteZip`` accept a
+``metadata_encoding`` argument with the same semantics as
+``zipfile.ZipFile`` for entries without the flag:
+
+.. code-block:: python
+
+   from zipwire import SyncRemoteZip
+   from zipwire.backends import Urllib3Reader
+
+   reader = Urllib3Reader("https://archive.example/legacy.zip")
+   with SyncRemoteZip(reader, metadata_encoding="cp1252") as rz:
+       print(rz.namelist())
+
+The wheel classes do not expose the argument: they always decode entry
+names as UTF-8, as PEP 427 requires, even when the flag is missing.
+
 Passing a pre-configured client
 --------------------------------
 
-All backends accept an optional pre-configured client or session:
+HTTP backends accept an optional pre-configured client or session. The S3
+backend requires an existing client, as shown above:
 
 .. code-block:: python
 

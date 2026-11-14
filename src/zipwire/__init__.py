@@ -28,6 +28,9 @@ Asynchronous example
 ::
 
     import asyncio
+
+    import anyio
+
     from zipwire import AsyncRemoteZip
     from zipwire.backends import AiohttpReader
 
@@ -39,6 +42,10 @@ Asynchronous example
 
             # Stream a large entry directly to disk
             with open("local.bin", "wb") as fh:
+                await rz.read_into("large-file.bin", fh)
+
+            # ... or to an asynchronous writable object
+            async with await anyio.open_file("local.bin", "wb") as fh:
                 await rz.read_into("large-file.bin", fh)
 
     asyncio.run(main())
@@ -58,6 +65,19 @@ Asynchronous:
   - ``AiohttpReader`` -- uses *aiohttp* (``pip install zipwire[aiohttp]``)
   - ``Httpx2AsyncReader`` -- uses *httpx2*, supports HTTP/2
     (``pip install zipwire[httpx2]``)
+  - ``AiobotocoreReader`` -- reads S3 objects with a caller-owned async S3
+    client (``pip install zipwire[aiobotocore]``)
+
+::
+
+    from aiobotocore.session import get_session
+    from zipwire import AsyncRemoteZip
+    from zipwire.backends import AiobotocoreReader
+
+    async with get_session().create_client("s3") as client:
+        reader = AiobotocoreReader("my-bucket", "archive.zip", client=client)
+        async with AsyncRemoteZip(reader) as rz:
+            data = await rz.read("file.txt")
 
 Local files:
   - ``FileReader`` / ``AsyncFileReader`` -- read an archive from the local
@@ -108,12 +128,15 @@ from zipwire._errors import (
     FileNotFoundInZip,
     FileTooLarge,
     RangeRequestUnsupported,
+    SizeMismatch,
+    TruncatedStream,
     UnsupportedCompression,
+    UnsupportedFeature,
     ZipwireError,
 )
 from zipwire._parser import EOCDInfo
 from zipwire._sync import SyncRemoteZip
-from zipwire._types import AsyncReader, Headers, SyncReader, Writable
+from zipwire._types import AsyncReader, AsyncWritable, Headers, SyncReader, Writable
 from zipwire._wheel import AsyncRemoteWheel, SyncRemoteWheel
 from zipwire._zipinfo import RemoteZipInfo
 
@@ -121,6 +144,7 @@ __all__ = [
     "AsyncReader",
     "AsyncRemoteWheel",
     "AsyncRemoteZip",
+    "AsyncWritable",
     "BadZipFile",
     "CRCMismatch",
     "CompressionMethod",
@@ -130,10 +154,13 @@ __all__ = [
     "Headers",
     "RangeRequestUnsupported",
     "RemoteZipInfo",
+    "SizeMismatch",
     "SyncReader",
     "SyncRemoteWheel",
     "SyncRemoteZip",
+    "TruncatedStream",
     "UnsupportedCompression",
+    "UnsupportedFeature",
     "Writable",
     "ZipwireError",
 ]

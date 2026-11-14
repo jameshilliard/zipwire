@@ -60,6 +60,9 @@ Protocols and Types
 .. autoclass:: zipwire.Writable
    :members:
 
+.. autoclass:: zipwire.AsyncWritable
+   :members:
+
 Backends
 --------
 
@@ -78,6 +81,10 @@ Backends
 .. autoclass:: zipwire.backends._aiohttp.AiohttpReader
    :members:
 
+.. autoclass:: zipwire.backends._aiobotocore.AiobotocoreReader
+   :members:
+   :special-members: __aenter__, __aexit__
+
 .. autoclass:: zipwire.backends._file.FileReader
    :members:
    :special-members: __enter__, __exit__
@@ -94,8 +101,11 @@ Exceptions
    Exception
    └── ZipwireError
        ├── BadZipFile
+       ├── UnsupportedFeature
        ├── UnsupportedCompression
        ├── CRCMismatch
+       ├── SizeMismatch
+       ├── TruncatedStream
        ├── FileTooLarge
        ├── RangeRequestUnsupported
        └── FileNotFoundInZip (also inherits KeyError)
@@ -106,10 +116,19 @@ Exceptions
 .. autoexception:: zipwire.BadZipFile
    :show-inheritance:
 
+.. autoexception:: zipwire.UnsupportedFeature
+   :show-inheritance:
+
 .. autoexception:: zipwire.UnsupportedCompression
    :show-inheritance:
 
 .. autoexception:: zipwire.CRCMismatch
+   :show-inheritance:
+
+.. autoexception:: zipwire.SizeMismatch
+   :show-inheritance:
+
+.. autoexception:: zipwire.TruncatedStream
    :show-inheritance:
 
 .. autoexception:: zipwire.FileTooLarge

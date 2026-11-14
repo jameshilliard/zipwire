@@ -5,7 +5,7 @@ from __future__ import annotations
 import typing
 
 if typing.TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncGenerator, Generator
 
 
 @typing.runtime_checkable
@@ -21,11 +21,15 @@ class Headers(typing.Protocol):
     with lower-case keys.
     """
 
-    def __getitem__(self, key: str) -> str: ...
+    def __getitem__(self, key: str, /) -> str: ...
 
-    def __contains__(self, key: object) -> bool: ...
+    def __contains__(self, key: object, /) -> bool: ...
 
-    def get(self, key: str, default: str | None = None) -> str | None: ...
+    @typing.overload
+    def get(self, key: str, /) -> str | None: ...
+
+    @typing.overload
+    def get(self, key: str, default: str | None, /) -> str | None: ...
 
 
 @typing.runtime_checkable
@@ -59,8 +63,19 @@ class SyncReader(typing.Protocol):
         """
         ...
 
-    def stream_range(self, offset: int, length: int) -> Iterator[bytes]:
-        """Stream *length* bytes starting at *offset* as chunks."""
+    def stream_range(self, offset: int, length: int) -> Generator[bytes, None, None]:
+        """Stream *length* bytes starting at *offset* as chunks.
+
+        Must return a generator.  Zipwire closes it with
+        :func:`contextlib.closing` when extraction stops early, so the
+        underlying response is released promptly.
+
+        .. versionchanged:: 0.5.0
+
+           The return type changed from ``Iterator[bytes]`` to
+           ``Generator[bytes, None, None]``.  Custom sync backends must
+           return a generator so zipwire can close it.
+        """
         ...
 
     def close(self) -> None:
@@ -99,8 +114,19 @@ class AsyncReader(typing.Protocol):
         """
         ...
 
-    def stream_range(self, offset: int, length: int) -> AsyncIterator[bytes]:
-        """Stream *length* bytes starting at *offset* as chunks."""
+    def stream_range(self, offset: int, length: int) -> AsyncGenerator[bytes, None]:
+        """Stream *length* bytes starting at *offset* as chunks.
+
+        Must return an async generator.  Zipwire closes it with
+        :func:`contextlib.aclosing` when extraction stops early, so the
+        underlying response is released promptly.
+
+        .. versionchanged:: 0.5.0
+
+           The return type changed from ``AsyncIterator[bytes]`` to
+           ``AsyncGenerator[bytes, None]``.  Custom async backends must
+           return an async generator so zipwire can close it.
+        """
         ...
 
     async def close(self) -> None:
@@ -110,6 +136,32 @@ class AsyncReader(typing.Protocol):
 
 @typing.runtime_checkable
 class Writable(typing.Protocol):
-    """Protocol for writable file-like objects (io.BytesIO, io.BufferedWriter, etc.)."""
+    """Protocol for writable file-like objects (io.BytesIO, io.BufferedWriter, etc.).
 
-    def write(self, data: bytes, /) -> object: ...
+    ``write()`` returns the number of bytes accepted, or ``None`` when the
+    whole chunk was written.  Buffered and in-memory streams always report
+    the count; ``None`` accommodates user-defined writers that signal
+    success without one.  A short write is retried with the remaining
+    bytes; a count that is not an :class:`int`, or is zero, negative, or
+    oversized, raises :exc:`OSError`, because retrying it could loop
+    forever.
+    """
+
+    def write(self, data: bytes, /) -> int | None: ...
+
+
+class AsyncWritable(typing.Protocol):
+    """Protocol for asynchronous writable objects (anyio.AsyncFile, etc.).
+
+    ``write()`` returns an awaitable that resolves to the number of bytes
+    accepted or ``None`` when the whole chunk was written.  Zipwire awaits
+    it before producing more output, so a slow destination applies
+    backpressure to the transfer.  Short writes are retried and invalid
+    byte counts raise :exc:`OSError`, as for :class:`Writable`.
+
+    The protocol is for static typing only.  Synchronous destinations also
+    have a ``write`` attribute, so a runtime ``isinstance()`` check cannot
+    tell them apart; zipwire awaits the return value when it is awaitable.
+    """
+
+    def write(self, data: bytes, /) -> typing.Awaitable[int | None]: ...

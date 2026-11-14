@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import zipfile
+
 
 class ZipwireError(Exception):
     """Base exception for all zipwire errors."""
 
 
-class BadZipFile(ZipwireError):
+class BadZipFile(ZipwireError, zipfile.BadZipFile):
     """The data does not appear to be a valid ZIP archive."""
 
 
-class UnsupportedCompression(ZipwireError):
+class UnsupportedCompression(ZipwireError, NotImplementedError):
     """The file uses an unsupported compression method."""
 
     def __init__(self, method: int) -> None:
@@ -19,13 +21,34 @@ class UnsupportedCompression(ZipwireError):
         super().__init__(f"Unsupported compression method: {method}")
 
 
-class CRCMismatch(ZipwireError):
+class UnsupportedFeature(ZipwireError, NotImplementedError):
+    """The archive or an entry uses a ZIP feature zipwire does not support."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class CRCMismatch(BadZipFile):
     """CRC-32 check failed after decompression."""
 
     def __init__(self, expected: int, actual: int) -> None:
         self.expected = expected
         self.actual = actual
         super().__init__(f"CRC-32 mismatch: expected {expected:#010x}, got {actual:#010x}")
+
+
+class TruncatedStream(BadZipFile, EOFError):
+    """A compressed stream ended early or received data past its end."""
+
+
+class SizeMismatch(ZipwireError):
+    """Decompressed size does not match the entry's declared file size."""
+
+    def __init__(self, expected: int, actual: int) -> None:
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"Size mismatch: expected {expected} bytes, got {actual}")
 
 
 class RangeRequestUnsupported(ZipwireError):

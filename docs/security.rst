@@ -29,21 +29,26 @@ size of a single entry:
 
 When the limit is exceeded, :exc:`~zipwire.FileTooLarge` is raised.
 
-**Two layers of protection:**
+Before member-specific range requests, the entry's declared ``file_size``
+from the central directory is compared against the limit. Both methods
+decode in bounded chunks and return at most the declared number of bytes,
+matching stdlib ``zipfile``. A smaller declared size truncates the output;
+the CRC must match the bytes actually returned. Stored entries can stop
+reading at that size. Compressed entries continue decoding to the codec's
+end marker or the declared compressed extent, discarding excess output in
+bounded chunks to detect codec errors. Streamed responses are closed on
+completion, failure, or cancellation. The output limit does not limit
+the total work spent decoding and discarding excess data.
 
-1. **Pre-check** -- before decompression starts, the entry's declared
-   ``file_size`` from the central directory is compared against the limit.
-   This catches honest zip bombs with no overhead.
-
-2. **Streaming enforcement** (:meth:`read_into` only) -- the streaming
-   decompressor tracks the actual decompressed output and aborts if it
-   exceeds the limit.  This catches crafted archives that lie about their
-   uncompressed size in the metadata.
-
-:meth:`read` performs only the pre-check (layer 1).  Because it
-decompresses the entire entry into memory in one step, it cannot enforce
-the limit during decompression.  Use :meth:`read_into` when processing
-untrusted archives for defence in depth.
+:meth:`read` still buffers the complete compressed and decompressed
+contents in memory. Use :meth:`read_into` to stream large entries to a
+destination. Decoded chunks are at most 2 MiB, including when decoding
+cached input. This is a chunk-size bound, not a limit on total memory use.
+Memory also includes input supplied by the backend, codec dictionaries,
+archive metadata, the adaptive wheel tail cache, and destination buffers.
+ZIP-LZMA dictionary size claims are clamped to 64 MiB.
+``max_file_size`` limits returned output; it does not impose a memory
+budget on those components.
 
 You can also inspect entries before extracting them:
 
@@ -81,6 +86,22 @@ filenames from the archive to construct file paths, always sanitise them:
            if not os.path.realpath(dest).startswith(os.path.realpath(output_dir)):
                print(f"Skipping path traversal: {info.filename}")
                continue
+
+Local header inconsistencies
+----------------------------
+
+Every ZIP entry is described twice: in the central directory and in
+the local file header that precedes the file data.  A crafted archive
+can name a different member in the two places, so tools that read the
+local header (many extractors and scanners) disagree with tools that
+read the central directory about what the archive contains.  This
+matters for supply-chain workflows such as wheel inspection even
+though zipwire never writes files to disk.
+
+When an entry is read, zipwire compares the local header's filename
+against the central directory name, like CPython's ``zipfile`` does in
+``ZipFile.open()``, and raises :exc:`~zipwire.BadZipFile` when they
+differ.
 
 Server trust
 ------------

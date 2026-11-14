@@ -5,9 +5,13 @@ from __future__ import annotations
 import io
 import logging
 import zipfile
+from typing import TYPE_CHECKING
 
 import pytest
 from werkzeug import Request, Response
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from tests.conftest import make_zip, needs_aiohttp, needs_httpx2, needs_requests
 from zipwire.__main__ import _print_table, main
@@ -24,7 +28,7 @@ def make_zip_with_dirs() -> bytes:
     return buf.getvalue()
 
 
-def _range_handler(zip_data: bytes):
+def _range_handler(zip_data: bytes) -> Callable[[Request], Response]:
     """Create a handler that supports HEAD and Range GET requests."""
 
     def handler(request: Request) -> Response:
@@ -81,7 +85,7 @@ class TestPrintTable:
     def test_output_format(self, stored_zip: bytes, capsys) -> None:
         eocd = find_eocd(stored_zip, len(stored_zip))
         cd_data = stored_zip[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = parse_central_directory(cd_data)
         infos = [RemoteZipInfo._from_central_dir_entry(e) for e in entries]
 
         _print_table(infos, skip_dirs=False)
@@ -100,7 +104,7 @@ class TestPrintTable:
     def test_skip_dirs(self, directory_zip: bytes, capsys) -> None:
         eocd = find_eocd(directory_zip, len(directory_zip))
         cd_data = directory_zip[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = parse_central_directory(cd_data)
         infos = [RemoteZipInfo._from_central_dir_entry(e) for e in entries]
 
         _print_table(infos, skip_dirs=True)
@@ -115,7 +119,7 @@ class TestPrintTable:
     def test_show_dirs(self, directory_zip: bytes, capsys) -> None:
         eocd = find_eocd(directory_zip, len(directory_zip))
         cd_data = directory_zip[eocd.cd_offset : eocd.cd_offset + eocd.cd_size]
-        entries = parse_central_directory(cd_data, eocd.cd_entry_count)
+        entries = parse_central_directory(cd_data)
         infos = [RemoteZipInfo._from_central_dir_entry(e) for e in entries]
 
         _print_table(infos, skip_dirs=False)

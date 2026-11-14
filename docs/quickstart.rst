@@ -34,7 +34,11 @@ Stream a file to disk
 
 :meth:`~zipwire.SyncRemoteZip.read_into` streams the compressed payload in
 chunks and decompresses on the fly, keeping peak memory low even for large
-entries:
+entries.  Decoded output is passed to the destination in chunks of at most
+2 MiB, so a highly compressible entry cannot inflate into a single large
+allocation.  Partial writes are retried, so raw unbuffered streams work as
+destinations.  A destination's ``write()`` must return the number of bytes
+accepted, or ``None`` for the whole chunk:
 
 .. code-block:: python
 
@@ -45,6 +49,16 @@ entries:
    with SyncRemoteZip(reader) as rz:
        with open("output.bin", "wb") as f:
            rz.read_into("big-file.bin", f)
+
+Decoded chunks are at most 2 MiB. Total memory also depends on codec
+dictionaries, archive metadata, backend and destination buffering, and
+the wheel tail cache. ``max_file_size`` limits returned output rather
+than total memory or decoding work; see :doc:`security` for details.
+
+Custom destinations should return the number of bytes written, or
+``None`` if the whole chunk was consumed. Short writes are retried;
+invalid byte counts raise ``OSError``. Destinations that would block
+must raise ``BlockingIOError``.
 
 Read a local archive
 ^^^^^^^^^^^^^^^^^^^^
@@ -64,6 +78,35 @@ dependency:
 
    # Or from a file:// URI
    reader = FileReader.from_uri("file:///path/to/archive.zip")
+
+Passwords and comments
+----------------------
+
+Pass a bytes password to ``read`` or ``read_into`` for traditionally
+encrypted ZIP entries. ``setpassword`` supplies a default for subsequent
+reads; an explicit password overrides it:
+
+.. code-block:: python
+
+   with SyncRemoteZip(reader) as rz:
+       print(rz.comment)
+       rz.setpassword(b"archive-password")
+       data = rz.read("private.txt")
+       with open("output.bin", "wb") as dest:
+           rz.read_into("other.bin", dest, pwd=b"different-password")
+
+Passwords and archive comments also work with ``AsyncRemoteZip`` and both
+wheel classes:
+
+.. code-block:: python
+
+   async with AsyncRemoteZip(reader) as rz:
+       data = await rz.read("private.txt", pwd=b"archive-password")
+
+Stored, Deflate, Bzip2, ZIP-LZMA, and ZIP64 archives are supported.
+Zstandard (including legacy method 20) requires Python's
+``compression.zstd`` module, available from Python 3.14. AES encryption,
+split archives, Deflate64, and PPMd are not supported.
 
 Asynchronous usage
 ------------------
@@ -149,6 +192,33 @@ Async streaming to disk
 
    asyncio.run(main())
 
+:meth:`~zipwire.AsyncRemoteZip.read_into` also accepts asynchronous
+writable objects, such as ``anyio.AsyncFile``.  When ``write()`` returns
+an awaitable, zipwire waits for that write to finish before it reads more
+input, so a slow destination throttles the download.  Partial writes are
+retried in both modes, and a byte count that is not an integer, or is zero,
+negative, or oversized, raises ``OSError``.  Any object with an awaitable
+``write()`` works; the example uses anyio:
+
+.. code-block:: python
+
+   import asyncio
+
+   import anyio
+
+   from zipwire import AsyncRemoteZip
+   from zipwire.backends import AiohttpReader
+
+
+   async def main():
+       reader = AiohttpReader("https://archive.example/large.zip")
+       async with AsyncRemoteZip(reader) as rz:
+           async with await anyio.open_file("output.bin", "wb") as f:
+               await rz.read_into("big-file.bin", f)
+
+
+   asyncio.run(main())
+
 Wheel dist-info metadata
 ------------------------
 
@@ -190,6 +260,27 @@ Async variant:
 
    asyncio.run(main())
 
+Legacy filename encodings
+-------------------------
+
+Entry names are decoded as UTF-8 when the general purpose flag bit 11
+is set and as CP437 otherwise, as in the standard library's ``zipfile``.
+``SyncRemoteZip`` and ``AsyncRemoteZip`` accept a
+``metadata_encoding`` argument with the same semantics as
+``zipfile.ZipFile`` for entries without the flag:
+
+.. code-block:: python
+
+   from zipwire import SyncRemoteZip
+   from zipwire.backends import Urllib3Reader
+
+   reader = Urllib3Reader("https://archive.example/legacy.zip")
+   with SyncRemoteZip(reader, metadata_encoding="cp1252") as rz:
+       print(rz.namelist())
+
+The wheel classes do not expose the argument: they always decode entry
+names as UTF-8, as PEP 427 requires, even when the flag is missing.
+
 Passing a pre-configured client
 --------------------------------
 
@@ -208,3 +299,32 @@ All backends accept an optional pre-configured client or session:
        )
        with SyncRemoteZip(reader) as rz:
            data = rz.read("secret.txt")
+
+Performance and async scheduling
+--------------------------------
+
+Central-directory data already in the initial tail is reused. Wheel
+readers also serve complete cached members without additional requests.
+``max_file_size`` rejects oversized entries before any member-specific
+range request, using the metadata loaded when the archive was opened.
+
+Async readers use AnyIO to yield between bounded decoding steps on
+asyncio and Trio, including when input comes from a cache. Decryption uses
+smaller steps because traditional ZipCrypto executes in Python. These checkpoints
+allow other tasks to run and deliver cancellation without waiting for an
+entire entry to be decoded. Codec calls and synchronous destination writes
+execute on the event-loop thread; asynchronous writes are awaited.
+
+The repository includes a local benchmark:
+
+.. code-block:: console
+
+   .venv/bin/python benchmarks/bench_read.py
+
+It reports extraction throughput, event-loop scheduling gaps, range
+request counts, and peak traced allocations. It excludes archive creation
+and network time. Source archives are allocated before memory tracing,
+and native allocations that bypass Python's allocator are not included.
+``--encrypted-zip PATH`` adds a single-entry ZipCrypto archive with the
+test password ``test``. No external ZIP tool is needed to run the default
+benchmark.

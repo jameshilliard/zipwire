@@ -6,6 +6,31 @@ servers.  Each backend is a thin wrapper around a popular HTTP library that
 implements the :class:`~zipwire.SyncReader` or :class:`~zipwire.AsyncReader`
 protocol.
 
+Archive parsing, passwords, filename decoding, and decompression are
+shared across backends. These options belong to ``SyncRemoteZip`` /
+``AsyncRemoteZip`` (and their wheel subclasses), rather than the HTTP
+client. The ``metadata_encoding`` option is available only on the generic
+ZIP classes; wheel classes always decode names as UTF-8.
+Async readers retain native async range I/O, including additional
+requests for ZIP64 metadata outside the initial tail.
+
+Member filename lengths are checked before requesting more header bytes.
+Payload range requests use validated compressed extents. The same
+validation applies to duplicate header references and cached wheel entries.
+
+Sync readers must return generators with ``close()``; async readers must
+return async generators with ``aclose()``. Extraction calls these on exit,
+including after decoding or writing errors, so backends can promptly
+release the response body. Response cleanup also covers HTTP status errors
+and early completion. Unread bodies are closed before their connections
+are returned to a pool.
+
+Loading an archive reuses its central directory from the initial tail
+when the full directory is present there. Otherwise the directory is
+fetched separately. Wheel readers additionally reuse members whose local
+headers and compressed data are in the tail, using their actual header
+lengths to determine whether they fit.
+
 Available backends
 ------------------
 
@@ -104,8 +129,12 @@ an empty or ``localhost`` host).
 
 Regular files do not support true non-blocking IO, so
 :class:`~zipwire.backends.AsyncFileReader` offloads every blocking call to a
-worker thread via :func:`asyncio.to_thread` -- the same approach libraries
+worker thread in the event loop's executor -- the same approach libraries
 such as ``aiofiles`` use internally, without the extra dependency.
+Cancellation waits for the active file operation to finish before
+propagating, so context-manager cleanup cannot race an unfinished open
+or read. Closing also finishes and clears the handle before propagating
+cancellation.
 
 .. code-block:: python
 
@@ -152,7 +181,7 @@ protocol and pass an instance to :class:`~zipwire.SyncRemoteZip` or
 
 .. code-block:: python
 
-   from collections.abc import Iterator
+   from collections.abc import Generator
 
    from zipwire import Headers, SyncReader, SyncRemoteZip
 
@@ -173,7 +202,9 @@ protocol and pass an instance to :class:`~zipwire.SyncRemoteZip` or
        ) -> tuple[bytes, Headers]:
            ...  # GET with Range header, return (data, response_headers)
 
-       def stream_range(self, offset: int, length: int) -> Iterator[bytes]:
+       def stream_range(
+           self, offset: int, length: int
+       ) -> Generator[bytes, None, None]:
            ...  # GET with Range header, yield chunks
 
        def close(self) -> None:
@@ -183,6 +214,20 @@ protocol and pass an instance to :class:`~zipwire.SyncRemoteZip` or
 
 See the :class:`~zipwire.SyncReader` and :class:`~zipwire.AsyncReader`
 protocol definitions for the full method signatures.
+
+An asynchronous reader's ``stream_range()`` must return an async generator.
+Zipwire closes it with :func:`contextlib.aclosing` when extraction finishes,
+fails, or is cancelled, so a custom backend can release its HTTP response in
+a ``finally`` block or an async context manager.
+
+A synchronous reader's ``stream_range()`` must return a generator.  Zipwire
+closes it with :func:`contextlib.closing` when extraction finishes, fails,
+or stops early, so a custom backend can release its HTTP response in a
+``finally`` block.  If closing raises, the close error may mask the error
+that aborted extraction; the original remains in the ``__context__`` chain.
+
+The archive and its reader are also closed when the context manager fails to
+load the archive, so no connection or file handle is left behind.
 
 Why only absolute byte ranges?
 -------------------------------

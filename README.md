@@ -29,6 +29,10 @@ CDNs, object stores, and static file servers do.
   wheel's `.dist-info` (METADATA, WHEEL, RECORD) straight from PyPI in a single
   adaptive tail request, without downloading the wheel.
 - **ZIP64** - supports archives and entries larger than 4 GiB.
+- **ZIP compatibility** - reads stored, Deflate, Bzip2, and ZIP-LZMA
+  entries, plus Zstandard on Python 3.14+. Supports prepended data,
+  Unicode filename extra fields, archive comments, and traditional
+  ZipCrypto passwords through `read(..., pwd=b"password")` or `setpassword()`.
 - **Pluggable backends** - bring your own HTTP library (see below).
 - **Local files** - `FileReader` / `AsyncFileReader` open an archive on disk
   through the exact same API, no HTTP server required.
@@ -139,6 +143,16 @@ from zipwire.backends import FileReader
 with SyncRemoteZip(FileReader("/path/to/archive.zip")) as rz:
     data = rz.read("path/to/file.txt")
 ```
+
+## Contributing
+
+Contributions are welcome. The issue and pull-request workflow is described in
+[CONTRIBUTING.md](https://github.com/tiran/zipwire/blob/main/CONTRIBUTING.md);
+project setup, commands, code style, and changelog conventions are in
+[AGENTS.md](https://github.com/tiran/zipwire/blob/main/AGENTS.md). Please report
+security problems through
+[private vulnerability reporting](https://github.com/tiran/zipwire/security/advisories/new),
+not a public issue.
 
 ## License
 

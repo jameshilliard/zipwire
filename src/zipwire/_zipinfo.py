@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-import struct
-import typing
+import os
 import zipfile
+from dataclasses import replace
 
-from zipwire._constants import ZIP64_EXTRA_FIELD_ID
-
-if typing.TYPE_CHECKING:
-    from zipwire._parser import CentralDirEntry
+from zipwire._constants import ExtraDataId
+from zipwire._zipstructs import (
+    CentralDirHeaderRecord,
+    UnicodePathExtraField,
+    Zip64ExtendedInfo,
+    iter_extra_fields,
+    uint16_t,
+    uint32_t,
+)
 
 
 class RemoteZipInfo(zipfile.ZipInfo):
@@ -19,28 +24,24 @@ class RemoteZipInfo(zipfile.ZipInfo):
     attributes and methods (is_dir, FileHeader, etc.) are available.
     """
 
+    # End of the entry's data region: the next entry's local header
+    # offset, or the central directory offset for the last entry.
+    # RemoteZip assigns it after parsing the central directory; it is
+    # None for entries that have not been through that step.
+    _end_offset: int | None = None
+    _raw_time: int
+
     @classmethod
-    def _from_central_dir_entry(cls, entry: CentralDirEntry) -> RemoteZipInfo:
+    def _from_central_dir_entry(
+        cls,
+        entry: CentralDirHeaderRecord,
+        *,
+        metadata_encoding: str | None = None,
+    ) -> RemoteZipInfo:
         """Construct a ZipInfo from a parsed central directory entry."""
-        # Decode filename
-        # Bit 11 of flags indicates UTF-8 encoding
-        if entry.flags & 0x800:
-            filename = entry.filename.decode("utf-8")
-        else:
-            filename = entry.filename.decode("cp437")
+        info = cls(entry.decode_filename(metadata_encoding=metadata_encoding))
 
-        info = cls(filename)
-
-        # Convert DOS date/time to tuple
-        info.date_time = (
-            ((entry.mod_date >> 9) & 0x7F) + 1980,  # year
-            (entry.mod_date >> 5) & 0x0F,  # month
-            entry.mod_date & 0x1F,  # day
-            (entry.mod_time >> 11) & 0x1F,  # hour
-            (entry.mod_time >> 5) & 0x3F,  # minute
-            (entry.mod_time & 0x1F) * 2,  # second
-        )
-
+        info.date_time = entry.date_time
         info.compress_type = entry.compression_method
         info.CRC = entry.crc32
         info.compress_size = entry.compressed_size
@@ -48,46 +49,45 @@ class RemoteZipInfo(zipfile.ZipInfo):
         info.header_offset = entry.header_offset
         info.internal_attr = entry.internal_attr
         info.external_attr = entry.external_attr
-        info.create_system = (entry.version_made_by >> 8) & 0xFF
-        info.create_version = entry.version_made_by & 0xFF
-        info.extract_version = entry.version_needed
+        info.create_system = entry.create_system
+        info.create_version = entry.create_version
+        info.extract_version = entry.version_needed & 0xFF
+        info.reserved = entry.version_needed >> 8
+        if info.extract_version > 63:
+            raise NotImplementedError(f"ZIP version {info.extract_version / 10:.1f}")
         info.flag_bits = entry.flags
         info.volume = entry.disk_start
         info.extra = entry.extra
         info.comment = entry.comment
+        info._raw_time = entry.mod_time
 
-        # Handle ZIP64 extra field
-        _apply_zip64_extra(info)
+        # Resolve fields in directory order, retaining the current values
+        # so repeated ZIP64 fields only consume still-unresolved sentinels.
+        current = entry
+        for field in iter_extra_fields(entry.extra):
+            if field.header_id == ExtraDataId.ZIP64:
+                zip64 = Zip64ExtendedInfo.resolve(field.data, current)
+                if zip64.file_size is not None:
+                    info.file_size = zip64.file_size
+                if zip64.compress_size is not None:
+                    info.compress_size = zip64.compress_size
+                if zip64.header_offset is not None:
+                    info.header_offset = zip64.header_offset
+                if zip64.disk_start is not None:
+                    info.volume = zip64.disk_start
+                current = replace(
+                    current,
+                    uncompressed_size=uint32_t(info.file_size),
+                    compressed_size=uint32_t(info.compress_size),
+                    header_offset=uint32_t(info.header_offset),
+                    disk_start=uint16_t(info.volume),
+                )
+            elif field.header_id == ExtraDataId.UNICODE_PATH:
+                unicode_path = UnicodePathExtraField.resolve(field.data, entry.filename)
+                if unicode_path is not None:
+                    name = unicode_path.name
+                    if os.sep != "/" and os.sep in name:
+                        name = name.replace(os.sep, "/")
+                    info.filename = name
 
         return info
-
-
-def _apply_zip64_extra(info: RemoteZipInfo) -> None:
-    """Parse ZIP64 extra field and update sizes/offset if present."""
-    extra = info.extra
-    if not extra:
-        return
-
-    offset = 0
-    while offset + 4 <= len(extra):
-        header_id, data_size = struct.unpack_from("<HH", extra, offset)
-        offset += 4
-
-        if header_id == ZIP64_EXTRA_FIELD_ID:
-            # ZIP64 extended information extra field
-            # Fields appear in order only if the corresponding regular field is 0xFFFFFFFF
-            idx = 0
-            if info.file_size == 0xFFFFFFFF and idx + 8 <= data_size:
-                info.file_size = struct.unpack_from("<Q", extra, offset + idx)[0]
-                idx += 8
-            if info.compress_size == 0xFFFFFFFF and idx + 8 <= data_size:
-                info.compress_size = struct.unpack_from("<Q", extra, offset + idx)[0]
-                idx += 8
-            if info.header_offset == 0xFFFFFFFF and idx + 8 <= data_size:
-                info.header_offset = struct.unpack_from("<Q", extra, offset + idx)[0]
-                idx += 8
-            if info.volume == 0xFFFF and idx + 4 <= data_size:
-                info.volume = struct.unpack_from("<I", extra, offset + idx)[0]
-            return
-
-        offset += data_size

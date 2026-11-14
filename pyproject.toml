@@ -22,13 +22,14 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]
-dependencies = ["urllib3>=2"]
+dependencies = ["anyio>=4", "urllib3>=2"]
 
 [project.urls]
 Homepage = "https://github.com/tiran/zipwire"
 Documentation = "https://zipwire.readthedocs.io/"
 Source = "https://github.com/tiran/zipwire"
 Issues = "https://github.com/tiran/zipwire/issues"
+Changelog = "https://github.com/tiran/zipwire/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 httpx2 = ["httpx2[http2]>=2"]
@@ -39,10 +40,14 @@ all = ["httpx2[http2]>=2", "aiohttp>=3.9", "requests>=2.28"]
 [dependency-groups]
 dev = [
     "zipwire[all]",
+    "anyio>=4",
+    "trio>=0.25",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "pytest-httpserver>=1",
     "coverage[toml]>=7",
+    "mypy>=2.4",
+    "pyrefly>=1.4",
     "ruff>=0.11",
 ]
 docs = [
@@ -65,6 +70,7 @@ packages = ["src/zipwire"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = ["integration: tests that hit real network services (deselect with '-m not integration')"]
 addopts = "-m 'not integration'"
 
@@ -74,6 +80,23 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "UP", "B", "SIM", "TCH", "RUF"]
+
+[tool.pyrefly]
+project-includes = ["src/**/*.py", "tests/**/*.py"]
+python-version = "3.11"
+enable-fallback-search-path = true
+ignore-missing-imports = [
+    "compression",  # Python 3.14+
+    "compression.zstd",
+]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["compression", "compression.zstd"]
+ignore_missing_imports = true
 
 [tool.coverage.run]
 branch = true

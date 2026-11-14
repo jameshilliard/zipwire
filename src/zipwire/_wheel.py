@@ -27,13 +27,15 @@ import typing
 from urllib.parse import unquote, urlparse
 
 from zipwire._async import AsyncRemoteZip
-from zipwire._constants import LOCAL_FILE_HEADER_SIZE, PREFETCH_EXTRA
-from zipwire._parser import parse_local_file_header
+from zipwire._base import RemoteZipBase
 from zipwire._sync import SyncRemoteZip
-from zipwire._zipinfo import RemoteZipInfo
+from zipwire._zipstructs import LocalFileHeaderRecord
 
 if typing.TYPE_CHECKING:
+    import zipfile
+
     from zipwire._types import AsyncReader, SyncReader
+    from zipwire._zipinfo import RemoteZipInfo
 
 # Minimum tail fetch size.  The actual tail is max(_MIN_TAIL_SIZE,
 # file_size // 256), scaling to ~0.4% of the archive for large wheels.
@@ -66,7 +68,7 @@ def _dist_info_from_url(url: str) -> str:
     return f"{parts[0]}-{parts[1]}.dist-info/"
 
 
-class _RemoteWheelMixin:
+class _RemoteWheelMixin(RemoteZipBase):
     """Shared state and accessors for wheel subclasses."""
 
     _dist_info_dir: str
@@ -105,15 +107,19 @@ class _RemoteWheelMixin:
         # the end of multi-GB wheels (e.g. PyTorch, vLLM) is covered.
         return max(_MIN_TAIL_SIZE, file_size // 256)
 
+    def _store_tail(self, tail_start: int, tail: bytes) -> None:
+        self._tail_start = tail_start
+        self._tail_data = tail
+
     def _clear(self) -> None:
-        super()._clear()  # type: ignore[misc]
+        super()._clear()
         self._tail_start = 0
         self._tail_data = b""
 
     def _resolve_from_tail(
         self,
-        info: RemoteZipInfo,
-    ) -> tuple[RemoteZipInfo, int, bytes] | None:
+        info: zipfile.ZipInfo,
+    ) -> tuple[zipfile.ZipInfo, int, bytes] | None:
         """Try to resolve an entry's compressed data from the tail buffer.
 
         Returns ``(info, data_offset, compressed)`` if the entry fits
@@ -121,15 +127,14 @@ class _RemoteWheelMixin:
         """
         tail_start = self._tail_start
         tail_end = tail_start + len(self._tail_data)
-        end = info.header_offset + LOCAL_FILE_HEADER_SIZE + PREFETCH_EXTRA + info.compress_size
-        if info.header_offset < tail_start or end > tail_end:
+        if info.header_offset < tail_start:
             return None
         rel = info.header_offset - tail_start
-        local_header = parse_local_file_header(self._tail_data[rel:])
-        data_start = rel + LOCAL_FILE_HEADER_SIZE + local_header.data_offset_past_header
-        data_offset = (
-            info.header_offset + LOCAL_FILE_HEADER_SIZE + local_header.data_offset_past_header
-        )
+        header = LocalFileHeaderRecord.parse(self._tail_data, offset=rel)
+        data_offset = self._validate_local_header(info, header)
+        if data_offset + info.compress_size > tail_end:
+            return None
+        data_start = data_offset - tail_start
         compressed = self._tail_data[data_start : data_start + info.compress_size]
         return info, data_offset, compressed
 
@@ -139,11 +144,7 @@ class _RemoteWheelMixin:
         Returns only files, not directory entries.
         """
         prefix = self._dist_info_dir
-        return [
-            e
-            for e in self.infolist()  # type: ignore[attr-defined]
-            if e.filename.startswith(prefix) and not e.is_dir()
-        ]
+        return [e for e in self.infolist() if e.filename.startswith(prefix) and not e.is_dir()]
 
 
 class SyncRemoteWheel(_RemoteWheelMixin, SyncRemoteZip):
@@ -164,20 +165,14 @@ class SyncRemoteWheel(_RemoteWheelMixin, SyncRemoteZip):
     """
 
     def __init__(self, reader: SyncReader) -> None:
-        super().__init__(reader)
+        # PEP 427 requires UTF-8 file names.
+        super().__init__(reader, metadata_encoding="utf-8")
         self._init_wheel(reader.url)
-
-    def __enter__(self) -> SyncRemoteWheel:
-        self._tail_start, self._tail_data = self._ensure_loaded()
-        return self
 
     def _resolve_entry(
         self,
-        name: str | RemoteZipInfo,
-    ) -> tuple[RemoteZipInfo, int, bytes | None] | None:
-        info = name if isinstance(name, RemoteZipInfo) else self.getinfo(name)
-        if info.is_dir():
-            return None
+        info: zipfile.ZipInfo,
+    ) -> tuple[zipfile.ZipInfo, int, bytes | None]:
         result = self._resolve_from_tail(info)
         if result is not None:
             return result
@@ -202,20 +197,14 @@ class AsyncRemoteWheel(_RemoteWheelMixin, AsyncRemoteZip):
     """
 
     def __init__(self, reader: AsyncReader) -> None:
-        super().__init__(reader)
+        # PEP 427 requires UTF-8 file names.
+        super().__init__(reader, metadata_encoding="utf-8")
         self._init_wheel(reader.url)
-
-    async def __aenter__(self) -> AsyncRemoteWheel:
-        self._tail_start, self._tail_data = await self._ensure_loaded()
-        return self
 
     async def _resolve_entry(
         self,
-        name: str | RemoteZipInfo,
-    ) -> tuple[RemoteZipInfo, int, bytes | None] | None:
-        info = name if isinstance(name, RemoteZipInfo) else self.getinfo(name)
-        if info.is_dir():
-            return None
+        info: zipfile.ZipInfo,
+    ) -> tuple[zipfile.ZipInfo, int, bytes | None]:
         result = self._resolve_from_tail(info)
         if result is not None:
             return result
